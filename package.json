@@ -1,0 +1,29 @@
+{
+  "name": "liteweave",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "workspaces": [
+    "app",
+    "server",
+    "desktop",
+    "engine"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w app",
+    "dev:app": "npm run dev -w app",
+    "dev:server": "npm run dev -w server",
+    "dev:desktop": "npm run dev -w desktop",
+    "build": "npm run build -w app",
+    "lint": "npm run lint -w app && npm run lint -w server && npm run lint -w desktop",
+    "preview": "npm run preview -w app"
+  },
+  "overrides": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-popper": {
+      "react": "$react",
+      "react-dom": "$react-dom"
+    }
+  }
+}
