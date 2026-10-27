@@ -1,0 +1,19 @@
+{
+  "name": "@liteweave/desktop",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "dev": "electron . --dev",
+    "build:backend": "node scripts/build-backend.mjs",
+    "lint": "oxlint"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.1",
+    "electron": "44.9.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
