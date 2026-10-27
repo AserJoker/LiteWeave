@@ -1,0 +1,13 @@
+{
+  "general": {
+    "appearance": {
+      "theme": "light",
+      "fontSize": 14,
+      "language": "zh-CN"
+    },
+    "behavior": {
+      "autoSave": true,
+      "confirmDelete": true
+    }
+  }
+}
