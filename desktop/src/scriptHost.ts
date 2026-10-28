@@ -17,6 +17,7 @@
  */
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { mat4, quat, vec3 } from 'gl-matrix'
 import {
   AssetLoader,
   Camera,
@@ -29,6 +30,63 @@ import {
   type Camera as CameraDesc,
   type PipelineGraph,
 } from '@liteweave/engine'
+
+/* ---------------- 几何组件（主进程专用，Runner 透明） ---------------- */
+/**
+ * TransformComponent —— 几何组件，挂在主进程 Entity（RO）上。
+ *
+ * 设计（见 2026-10-28 决策）：
+ * - 脚本调 setTransform 改 Component 参数（position/rotation quat/scale）
+ * - tick 末主进程算 modelMatrix = T×R×S，作为字段级命令推给 Runner
+ * - Runner 只看到 modelMatrix uniform 变更，不认识 Transform（渲染线程干净）
+ * - rotation 用四元数：无万向锁，为后续动画组件插值铺路
+ *
+ * 后续动画/物理组件会修改同一个 TransformComponent 的参数，组件统一算矩阵。
+ */
+type Vec3 = [number, number, number]
+type Quat = [number, number, number, number]
+
+class TransformComponent {
+  position: Vec3
+  rotation: Quat
+  scale: Vec3
+  constructor(opts?: { position?: Vec3; rotation?: Quat; scale?: Vec3 }) {
+    this.position = opts?.position ? [opts.position[0], opts.position[1], opts.position[2]] : [0, 0, 0]
+    this.rotation = opts?.rotation ? [opts.rotation[0], opts.rotation[1], opts.rotation[2], opts.rotation[3]] : [0, 0, 0, 1]
+    this.scale = opts?.scale ? [opts.scale[0], opts.scale[1], opts.scale[2]] : [1, 1, 1]
+  }
+  /** 覆盖式应用（未传字段保留；数组显式拷贝避免共享引用） */
+  apply(input: { position?: Vec3; rotation?: Quat; scale?: Vec3 }): void {
+    if (input.position) this.position = [input.position[0], input.position[1], input.position[2]]
+    if (input.rotation) this.rotation = [input.rotation[0], input.rotation[1], input.rotation[2], input.rotation[3]]
+    if (input.scale) this.scale = [input.scale[0], input.scale[1], input.scale[2]]
+  }
+  /** 算 modelMatrix = T(position) × R(rotation) × S(scale)（列主序 4×4） */
+  computeModelMatrix(): Float32Array {
+    const m = mat4.create()
+    mat4.fromRotationTranslationScale(
+      m,
+      quat.fromValues(this.rotation[0], this.rotation[1], this.rotation[2], this.rotation[3]),
+      vec3.fromValues(this.position[0], this.position[1], this.position[2]),
+      vec3.fromValues(this.scale[0], this.scale[1], this.scale[2]),
+    )
+    return m as Float32Array
+  }
+}
+
+/** 绕指定轴生成四元数（轴角对；脚本便捷工具） */
+function quatFromAxisAngle(ax: number, ay: number, az: number, angle: number): Quat {
+  const q = quat.create()
+  quat.setAxisAngle(q, [ax, ay, az], angle)
+  return [q[0], q[1], q[2], q[3]]
+}
+
+/** setTransform 的部分参数（所有字段可选，覆盖式语义） */
+interface TransformInput {
+  position?: Vec3
+  rotation?: Quat
+  scale?: Vec3
+}
 
 /** 脚本生命周期钩子（与 v0.1 一致） */
 interface ScriptHooks {
@@ -123,9 +181,18 @@ export function createScriptHost(opts: ScriptHostOptions) {
   let scriptHooks: ScriptHooks = {}
   let scriptLoaded = false
   let scriptStopped = false
-  let tickIntervalId: ReturnType<typeof setInterval> | null = null
+  /** 主循环运行标志（贪婪 while+sleep 循环的启停开关） */
+  let loopRunning = false
+  /** onTick 累积器：主循环每帧累加 frameDelta，≥tickRateMs 时回调 onTick 并减 tickRateMs */
+  let onTickAccum = 0
+  /** 主循环上一帧时间戳（算 frameDelta 用） */
+  let lastFrameTime = 0
 
   const roIndex = new Map<number, RenderObject>()
+  /** per-RO 几何组件（主进程专用；tick 末算 modelMatrix 推给 Runner） */
+  const transformIndex = new Map<number, TransformComponent>()
+  /** 本 tick 内 transform 有变更的 RO id 集合（tick 末遍历算矩阵写 dirty.fields） */
+  const dirtyTransforms = new Set<number>()
   const dirty: DirtyBuffer = { fields: [], camera: null }
 
   const engine = {
@@ -142,6 +209,31 @@ export function createScriptHost(opts: ScriptHostOptions) {
         if (!scene) return []
         return scene.renderObjects.map((r) => ({ id: r.id, modelId: r.model.id, materialId: r.material.id }))
       },
+      /**
+       * 设置几何组件参数（覆盖式：未传字段保留）。
+       * tick 末主进程算 modelMatrix = T×R×S，作为字段级命令推给 Runner。
+       * Runner 不认识 Transform，只看到 modelMatrix uniform 变更。
+       */
+      setTransform(roId: number, input: TransformInput) {
+        if (!transformIndex.has(roId)) {
+          throw new Error(`[engine.scene.setTransform] 未找到 RO id=${roId}`)
+        }
+        const t = transformIndex.get(roId)!
+        t.apply(input)
+        dirtyTransforms.add(roId)
+      },
+      /** 读几何组件当前参数（返回拷贝，脚本改不影响内部状态） */
+      getTransform(roId: number): { position: Vec3; rotation: Quat; scale: Vec3 } | undefined {
+        const t = transformIndex.get(roId)
+        if (!t) return undefined
+        return {
+          position: [t.position[0], t.position[1], t.position[2]],
+          rotation: [t.rotation[0], t.rotation[1], t.rotation[2], t.rotation[3]],
+          scale: [t.scale[0], t.scale[1], t.scale[2]],
+        }
+      },
+      /** 绕轴生成四元数（脚本便捷工具；轴角对） */
+      quatFromAxisAngle,
       setField(roId: number, fieldName: string, value: Float32Array) {
         const ro = roIndex.get(roId)
         if (!ro) throw new Error(`[engine.scene.setField] 未找到 RO id=${roId}`)
@@ -212,6 +304,11 @@ export function createScriptHost(opts: ScriptHostOptions) {
 
     for (const ro of scene.renderObjects) {
       roIndex.set(ro.id, ro)
+      // 每个 RO 默认内置几何组件（单位变换）；算初始 modelMatrix 写 fieldValues
+      // scene-ready 推送时 initialFieldValues 含 modelMatrix，Runner 直接建资源
+      const t = new TransformComponent()
+      transformIndex.set(ro.id, t)
+      ro.fieldValues.set('modelMatrix', t.computeModelMatrix())
     }
 
     camera = Camera.fromSceneCamera(scene.camera)
@@ -263,33 +360,79 @@ export function createScriptHost(opts: ScriptHostOptions) {
     }
   }
 
-  /** 启动 tick 循环 */
-  function startTick(): void {
-    if (tickIntervalId !== null) return
-    tickIntervalId = setInterval(() => {
-      if (scriptStopped) return
-      const delta = tickRateMs / 1000
-      engine.time.delta = delta
-      engine.time.elapsed += delta
-      engine.time.tickCount += 1
+  /**
+   * 启动贪婪主循环（while + await sleep 4ms）。
+   *
+   * 架构（见 2026-10-28 决策）：
+   * - 主循环高频跑（~250fps，sleep 4ms 让出 CPU），每帧算 modelMatrix 推 Runner
+   * - onTick 不是每帧回调，而是按 tickRateMs（50ms）节流：
+   *   累积 frameDelta，≥50ms 时回调 onTick(50ms) 并减 50ms（累积 delta 补偿漂移）
+   * - 动画/物理组件（未来）在主循环里高频跑，与 onTick 节流解耦
+   * - matrix 推送：每帧检查 dirtyTransforms，非空才算 matrix 推（只在 transform 变了才推）
+   */
+  async function startTick(): Promise<void> {
+    if (loopRunning) return
+    loopRunning = true
+    onTickAccum = 0
+    lastFrameTime = Date.now()
+    console.log(`[scriptHost] 贪婪主循环已启动（onTick 节流 ${tickRateMs}ms，sleep 4ms）`)
 
-      if (scriptHooks.onTick) {
-        try {
-          scriptHooks.onTick(delta)
-        } catch (err) {
-          console.error('[scriptHost] 脚本 onTick 抛错，停脚本（渲染继续）:', err)
-          scriptStopped = true
-          scriptHooks = {}
-          runnerManager.sendToRunner({
-            type: 'script-error',
-            message: err instanceof Error ? err.message : String(err),
-          })
+    while (loopRunning) {
+      const now = Date.now()
+      const frameDeltaMs = now - lastFrameTime
+      lastFrameTime = now
+
+      if (!scriptStopped) {
+        // onTick 节流：累积 frameDelta，≥tickRateMs 时回调脚本
+        onTickAccum += frameDeltaMs
+        if (onTickAccum >= tickRateMs) {
+          const tickDelta = tickRateMs / 1000
+          engine.time.delta = tickDelta
+          engine.time.elapsed += tickDelta
+          engine.time.tickCount += 1
+          // 减 tickRateMs 而非清零：多跑的 delta 累到下次（补偿漂移）
+          onTickAccum -= tickRateMs
+
+          if (scriptHooks.onTick) {
+            try {
+              scriptHooks.onTick(tickDelta)
+            } catch (err) {
+              console.error('[scriptHost] 脚本 onTick 抛错，停脚本（渲染继续）:', err)
+              scriptStopped = true
+              scriptHooks = {}
+              runnerManager.sendToRunner({
+                type: 'script-error',
+                message: err instanceof Error ? err.message : String(err),
+              })
+            }
+          }
         }
+
+        // 每帧：遍历 transform 有变更的 RO，算 modelMatrix 写 fieldValues + dirty.fields
+        // Runner 只看到 modelMatrix uniform 变更（字段级命令），不认识 TransformComponent
+        if (dirtyTransforms.size > 0) {
+          for (const roId of dirtyTransforms) {
+            const t = transformIndex.get(roId)
+            const ro = roIndex.get(roId)
+            if (!t || !ro) continue
+            const modelMatrix = t.computeModelMatrix()
+            ro.fieldValues.set('modelMatrix', modelMatrix)
+            dirty.fields.push({ roId, fieldName: 'modelMatrix', value: Array.from(modelMatrix) })
+          }
+          dirtyTransforms.clear()
+        }
+
+        flushDirty()
       }
 
-      flushDirty()
-    }, tickRateMs)
-    console.log(`[scriptHost] tick 循环已启动（间隔 ${tickRateMs}ms）`)
+      // sleep 4ms 让出 CPU（~250fps；Node setTimeout 最低 1ms 精度，4ms 是平衡点）
+      await new Promise<void>((resolve) => setTimeout(resolve, 4))
+    }
+  }
+
+  /** 停止贪婪主循环 */
+  function stopTick(): void {
+    loopRunning = false
   }
 
   /** tick 末批量推 dirty 给 Runner */
@@ -371,11 +514,8 @@ export function createScriptHost(opts: ScriptHostOptions) {
 
   /** 重新加载脚本（不重载 Scene） */
   async function reload(): Promise<void> {
-    // 停 tick + 清钩子
-    if (tickIntervalId !== null) {
-      clearInterval(tickIntervalId)
-      tickIntervalId = null
-    }
+    // 停主循环 + 清钩子
+    stopTick()
     if (scriptHooks.onDispose && !scriptStopped) {
       try {
         scriptHooks.onDispose()
@@ -388,6 +528,15 @@ export function createScriptHost(opts: ScriptHostOptions) {
     scriptStopped = false
     dirty.fields = []
     dirty.camera = null
+    dirtyTransforms.clear()
+    // 重置所有几何组件为单位变换（脚本 reload 从初始状态开始；Scene 不重载所以 RO 还是那些）
+    for (const [roId, t] of transformIndex) {
+      t.position = [0, 0, 0]
+      t.rotation = [0, 0, 0, 1]
+      t.scale = [1, 1, 1]
+      const ro = roIndex.get(roId)
+      if (ro) ro.fieldValues.set('modelMatrix', t.computeModelMatrix())
+    }
     engine.time = { elapsed: 0, delta: 0, tickCount: 0 }
 
     runnerManager.sendToRunner({ type: 'reload' })
@@ -401,10 +550,7 @@ export function createScriptHost(opts: ScriptHostOptions) {
 
   /** 停止 ScriptHost */
   function stop(): void {
-    if (tickIntervalId !== null) {
-      clearInterval(tickIntervalId)
-      tickIntervalId = null
-    }
+    stopTick()
     if (scriptHooks.onDispose && !scriptStopped) {
       try {
         scriptHooks.onDispose()
@@ -418,6 +564,8 @@ export function createScriptHost(opts: ScriptHostOptions) {
     scene = null
     camera = null
     roIndex.clear()
+    transformIndex.clear()
+    dirtyTransforms.clear()
     dirty.fields = []
     dirty.camera = null
     runnerManager.sendToRunner({ type: 'stop' })
