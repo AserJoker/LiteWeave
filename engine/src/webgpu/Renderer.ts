@@ -68,6 +68,8 @@ import type {
   Attachment,
   PipelineBinding,
   VertexLayout,
+  Scene,
+  Camera,
 } from '../types.js'
 import type {
   GpuModel,
@@ -75,6 +77,7 @@ import type {
   GpuAttachment,
   GpuUniformBufferInstance,
 } from './gpuResources.js'
+import { mat4 } from 'gl-matrix'
 
 /** 创建 Renderer 所需的初始化参数 */
 export interface RendererInit {
@@ -92,16 +95,29 @@ export class Renderer {
   // 持久化资产缓存（key = 资产外部 id；跨场景 diff 保留）
   private modelCache = new Map<string, GpuModel>()
   private pipelineCache = new Map<string, GpuPipeline>()
-  // UniformBuffer 实例缓存（per-RO per-pipeline 二层 Map；跟随 RO 一刀切释放）
+  // per-RO UniformBuffer 实例缓存（二层 Map；跟随 RO 一刀切释放）
   // 第一层 key = RenderObject.id（运行时内部 id）
   // 第二层 key = Pipeline.id（资产外部 id）—— 同一 RO 在不同 pipeline 下有独立 UniformBuffer
+  // 仅含 scope='instance' 字段（如 modelMatrix）
   private uniformBufferCache = new Map<number, Map<string, GpuUniformBufferInstance>>()
+  // 全局 UniformBuffer 缓存（key = Pipeline.id；scope='global' 字段如 viewProjection）
+  // 所有 RO 共享同一 buffer；Renderer 每帧按 currentCamera 算 VP 写入
+  private globalUniformBufferCache = new Map<string, GpuUniformBufferInstance>()
   // Attachment 按 graph 分桶（key = graph.id, value = attachment name → 资源）；
   // 解决不同 graph 同名 attachment 复用错误；swapchain 类型不缓存（每帧取）
   private attachmentCache = new Map<number, Map<string, GpuAttachment>>()
   // 当前活跃 graph（renderGraph 检测变化时触发 transitionGraph 释放旧 graph 资源）
   private activeGraph: PipelineGraph | null = null
-  // 当前 canvas 物理尺寸（attachment size='swapchain' 用）
+  // 当前活跃 scene（持 RO 列表；transitionGraph 用其收集 model id + 释放 UniformBuffer）
+  private activeScene: Scene | null = null
+  // 当前 view 矩阵（可变；脚本层持 Camera 对象算出后调 setView 同步进来）。
+  // 初始值：renderGraph 首次调用时从 scene.camera 算（lookAt(position, target, up)）。
+  // Renderer 不持 Camera 对象 —— Camera 是脚本层业务概念，跨层只传扁平矩阵数据（见隔离层契约）。
+  private viewMatrix: Float32Array | null = null
+  // 当前 projection 矩阵（可变；脚本层算后调 setProjection 同步进来）。
+  // 初始值：renderGraph 首次调用时从 scene.camera 算（perspective(fov, aspect, near, far)，aspect 由 canvas 自动填）。
+  private projectionMatrix: Float32Array | null = null
+  // 当前 canvas 物理尺寸（attachment size='swapchain' 用；初始 perspective 的 aspect 也用此）
   private currentWidth = 0
   private currentHeight = 0
 
@@ -330,12 +346,93 @@ export class Renderer {
    * 缓存：uniformBufferCache[ro.id][pipeline.id] = GpuUniformBufferInstance
    * 生命周期：跟随 RO（transitionGraph 释放旧 graph 时 destroy）
    */
+  /**
+   * 确保全局 UniformBuffer 存在并按当前 view/projection 矩阵算 viewProjection 写入。
+   * 缓存按 pipeline.id 索引（同 pipeline 的全局 buffer 所有 RO 共享）。
+   * 每帧重写 viewProjection（viewMatrix/projectionMatrix 变化时）。
+   *
+   * 设计：Renderer 只持 viewMatrix + projectionMatrix 两个 Float32Array（扁平数据），
+   * 不持 Camera 对象 —— Camera 是脚本层业务概念，跨层只传扁平矩阵（见隔离层契约）。
+   * 脚本层持 Camera 实例，算出矩阵后调 setView/setProjection 同步进来。
+   */
+  private ensureGlobalUniformBuffer(
+    pipeline: Pipeline,
+  ): GpuUniformBufferInstance | null {
+    // pipeline 无 global scope 字段 → 不需要全局 buffer
+    const globalLayout = pipeline.uniformBufferLayout.filter((f) => (f.scope ?? 'instance') === 'global')
+    if (globalLayout.length === 0) return null
+
+    let inst = this.globalUniformBufferCache.get(pipeline.id)
+    if (!inst) {
+      // 算总大小（取 globalLayout 中最大 offset+size，再 256 对齐）
+      let totalSize = 0
+      for (const f of globalLayout) {
+        totalSize = Math.max(totalSize, f.offset + f.size)
+      }
+      const alignedSize = this.alignTo256(totalSize)
+      const gpuBuffer = this.device.createBuffer({
+        size: alignedSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+      inst = { gpuBuffer, size: alignedSize, values: new Map() }
+      this.globalUniformBufferCache.set(pipeline.id, inst)
+    }
+
+    // 每帧按当前 viewMatrix × projectionMatrix 算 viewProjection 写入
+    if (this.viewMatrix && this.projectionMatrix) {
+      const vpSpec = globalLayout.find((f) => f.name === 'viewProjection')
+      if (vpSpec) {
+        const vp = this.computeViewProjection(this.viewMatrix, this.projectionMatrix)
+        this.device.queue.writeBuffer(inst.gpuBuffer, vpSpec.offset, vp)
+        inst.values.set('viewProjection', { offset: vpSpec.offset, data: vp })
+      }
+    }
+    return inst
+  }
+
+  /** 按 view × projection 算 viewProjection 矩阵（GPU 相乘用，写入 @binding(0)）。
+   *  注意顺序：VP = projection * view（列主序矩阵乘法，projection 在左） */
+  private computeViewProjection(view: Float32Array, projection: Float32Array): Float32Array {
+    const vp = mat4.create()
+    mat4.multiply(vp, projection, view)
+    return vp as Float32Array
+  }
+
+  /** 从 scene.camera 算初始 view + projection 矩阵（renderGraph 首次调用时）。
+   *  type='orthographic' 当前未实现参数，抛错提示后续补。
+   *  之后脚本层可调 setView/setProjection 覆盖。 */
+  private initMatricesFromSceneCamera(cam: Camera): void {
+    const aspect = cam.aspect ?? (this.currentWidth / Math.max(1, this.currentHeight))
+    if (cam.type === 'orthographic') {
+      throw new Error('[renderer] orthographic camera 暂未实现投影参数（type=orthographic 需补 left/right/top/bottom 或 size 字段）')
+    }
+    const view = mat4.create()
+    mat4.lookAt(view, cam.position, cam.target, cam.up)
+    const projection = mat4.create()
+    mat4.perspective(projection, cam.fov, aspect, cam.near, cam.far)
+    this.viewMatrix = view as Float32Array
+    this.projectionMatrix = projection as Float32Array
+  }
+
+  /** 同步 view 矩阵（脚本层持 Camera 对象算出后调此方法）。
+   *  传入的矩阵会被拷贝（避免外部修改影响内部状态）。下一帧 ensureGlobalUniformBuffer 自动反映。 */
+  setView(view: Float32Array): void {
+    this.viewMatrix = new Float32Array(view)
+  }
+
+  /** 同步 projection 矩阵（脚本层算出后调此方法；如 aspect 变化时重算 perspective）。
+   *  传入的矩阵会被拷贝。下一帧 ensureGlobalUniformBuffer 自动反映。 */
+  setProjection(projection: Float32Array): void {
+    this.projectionMatrix = new Float32Array(projection)
+  }
+
   private ensureUniformBuffer(
     ro: RenderObject,
     pipeline: Pipeline,
   ): GpuUniformBufferInstance | null {
-    // pipeline 无 uniform 字段（如 present pipeline）→ 不需要 UniformBuffer
-    if (pipeline.uniformBufferLayout.length === 0) return null
+    // pipeline 无 instance scope 字段（如 present pipeline）→ 不需要 per-RO UniformBuffer
+    const instanceLayout = pipeline.uniformBufferLayout.filter((f) => (f.scope ?? 'instance') === 'instance')
+    if (instanceLayout.length === 0) return null
 
     // 找/建 RO 的 uniform buffer 桶
     let roBucket = this.uniformBufferCache.get(ro.id)
@@ -357,14 +454,16 @@ export class Renderer {
     return inst
   }
 
-  /** 创建 UniformBuffer 实例（首次）：合并静态字段 + 可变字段，写入 GPU buffer */
+  /** 创建 per-RO UniformBuffer 实例（首次）：合并静态字段 + 可变字段，写入 GPU buffer。
+   *  只处理 scope='instance' 字段（global 字段归 ensureGlobalUniformBuffer） */
   private createUniformBufferInstance(
     ro: RenderObject,
     pipeline: Pipeline,
   ): GpuUniformBufferInstance {
-    // 算总大小（取 uniformBufferLayout 中最大 offset+size，再 256 对齐）
+    // 只算 instance scope 字段的总大小
+    const instanceLayout = pipeline.uniformBufferLayout.filter((f) => (f.scope ?? 'instance') === 'instance')
     let totalSize = 0
-    for (const f of pipeline.uniformBufferLayout) {
+    for (const f of instanceLayout) {
       totalSize = Math.max(totalSize, f.offset + f.size)
     }
     const alignedSize = this.alignTo256(totalSize)
@@ -382,9 +481,9 @@ export class Renderer {
     for (const [shaderUniformName, materialFieldName] of Object.entries(materialBindings)) {
       const fieldValue = ro.material.fields[materialFieldName]
       if (fieldValue instanceof Float32Array) {
-        const spec = pipeline.uniformBufferLayout.find((f) => f.name === shaderUniformName)
+        const spec = instanceLayout.find((f) => f.name === shaderUniformName)
         if (!spec) {
-          throw new Error(`[renderer] pipeline "${pipeline.id}" uniform "${shaderUniformName}" 未在 uniformBufferLayout 声明`)
+          throw new Error(`[renderer] pipeline "${pipeline.id}" instance uniform "${shaderUniformName}" 未在 uniformBufferLayout 声明`)
         }
         values.set(shaderUniformName, { offset: spec.offset, data: fieldValue })
         this.device.queue.writeBuffer(gpuBuffer, spec.offset, fieldValue)
@@ -404,19 +503,21 @@ export class Renderer {
     return { gpuBuffer, size: alignedSize, values }
   }
 
-  /** 更新 UniformBuffer 实例的可变字段（每帧调）：从 RO.fieldValues 按 pipelineBindings 映射更新 */
+  /** 更新 per-RO UniformBuffer 实例的可变字段（每帧调）：从 RO.fieldValues 按 pipelineBindings 映射更新。
+   *  只处理 scope='instance' 字段（global 字段归 ensureGlobalUniformBuffer） */
   private updateUniformBufferInstance(
     inst: GpuUniformBufferInstance,
     ro: RenderObject,
     pipeline: Pipeline,
   ): void {
+    const instanceLayout = pipeline.uniformBufferLayout.filter((f) => (f.scope ?? 'instance') === 'instance')
     const roBindings = ro.pipelineBindings[pipeline.id] ?? {}
     for (const [shaderUniformName, roFieldName] of Object.entries(roBindings)) {
       const data = ro.fieldValues.get(roFieldName)
       if (!data) continue  // 该字段无数据（可能未提供）
-      const spec = pipeline.uniformBufferLayout.find((f) => f.name === shaderUniformName)
+      const spec = instanceLayout.find((f) => f.name === shaderUniformName)
       if (!spec) {
-        throw new Error(`[renderer] pipeline "${pipeline.id}" uniform "${shaderUniformName}" 未在 uniformBufferLayout 声明`)
+        throw new Error(`[renderer] pipeline "${pipeline.id}" instance uniform "${shaderUniformName}" 未在 uniformBufferLayout 声明`)
       }
       const existing = inst.values.get(shaderUniformName)
       if (existing && existing.data === data) {
@@ -448,27 +549,51 @@ export class Renderer {
   /* ---------------- 渲染 PipelineGraph ---------------- */
 
   /**
-   * 渲染整个 PipelineGraph：按节点顺序遍历，每节点一个 render pass。
+   * 渲染整个 Scene：按 graph 节点顺序遍历，每节点一个 render pass。
    *
    * 帧时序：
    * 1. ensureAttachments（按当前 canvas 尺寸创建/重建离屏 attachment）
    * 2. 一个 encoder 含所有节点 pass
    * 3. 每节点：beginRenderPass(colorAttachments + depthStencil) → setPipeline →
-   *    对每个 RenderObject：setBindGroup(uniforms) + setVertexBuffer + setIndexBuffer + drawIndexed
+   *    筛选 scene.renderObjects 中 material.pipelineBindings 含 node.pipeline.id 的 RO →
+   *    对每个 RO：setBindGroup(uniforms) + setVertexBuffer + setIndexBuffer + drawIndexed
    * 4. submit 一次
    *
+   * RO 与 pass 关联规则：
+   * - RO 不显式声明 passName，靠 material.pipelineBindings 的 key 集合声明在哪些 pipeline 可见
+   * - Renderer 渲染 node 时按 `node.pipeline.id ∈ ro.material.pipelineBindings 的 key` 筛选 RO
+   * - 这与材质三段式 pipelineBindings 对称（材质静态字段映射 + RO 可变字段映射共用同一 key 空间）
+   *
    * 边（attachment 流动）的处理：
-   * - 节点的 colorAttachmentInputs 在 material.bindings 中已声明为 sampled-texture
+   * - 节点的 colorAttachmentInputs 在 pipeline.bindings 中声明为 sampled-texture
    * - Renderer 在 setBindGroup 时把对应 attachment 的 view 作为 binding 资源
-   * - 这要求 edge.toBinding 与 material.bindings 中的 binding 编号一致
+   * - 这要求 edge.toBinding 与 pipeline.bindings 中的 binding 编号一致
    */
-  renderGraph(graph: PipelineGraph): void {
+  renderGraph(graph: PipelineGraph, scene?: Scene): void {
     // graph 引用变化 → 触发场景切换 diff（释放旧 graph 的运行时资源 + 按 id diff 资产缓存）
     if (this.activeGraph !== graph) {
       if (this.activeGraph) {
-        this.transitionGraph(this.activeGraph, graph)
+        this.transitionGraph(this.activeGraph, graph, this.activeScene ?? undefined, scene)
       }
       this.activeGraph = graph
+      this.activeScene = scene ?? null
+      // 场景切换时从 scene.camera 算初始 view + projection 矩阵
+      // （之后脚本层可调 setView/setProjection 覆盖；Renderer 不持 Camera 对象）
+      if (scene?.camera) {
+        this.initMatricesFromSceneCamera(scene.camera)
+      } else {
+        this.viewMatrix = null
+        this.projectionMatrix = null
+      }
+    } else if (scene && this.activeScene !== scene) {
+      // 同一 graph 但 scene 引用变化（如切换 scene 实例）：更新 activeScene + 重算初始矩阵
+      this.activeScene = scene
+      if (scene.camera) {
+        this.initMatricesFromSceneCamera(scene.camera)
+      } else {
+        this.viewMatrix = null
+        this.projectionMatrix = null
+      }
     }
 
     this.ensureAttachments(graph)
@@ -482,7 +607,14 @@ export class Renderer {
     }
 
     for (const node of graph.nodes) {
-      this.renderNode(node, encoder, edgeIndex, graph)
+      // 筛选 scene 中 material.pipelineBindings 含 node.pipeline.id 的 RO
+      // （RO 通过材质声明自己在哪些 pipeline 可见；不显式绑定 passName）
+      const visibleRos = scene
+        ? scene.renderObjects.filter((ro) =>
+            Object.prototype.hasOwnProperty.call(ro.material.pipelineBindings, node.pipeline.id),
+          )
+        : []
+      this.renderNode(node, encoder, edgeIndex, graph, visibleRos)
     }
 
     this.device.queue.submit([encoder.finish()])
@@ -501,21 +633,40 @@ export class Renderer {
    * - 旧 graph 的 UniformBuffer 实例全部 destroy（per-RO per-pipeline）
    * - 旧 graph 的 attachment bucket 全部 destroy
    */
-  private transitionGraph(oldGraph: PipelineGraph, newGraph: PipelineGraph): void {
-    const newAssetIds = this.collectAssetIds(newGraph)
-    const oldAssetIds = this.collectAssetIds(oldGraph)
+  private transitionGraph(
+    oldGraph: PipelineGraph,
+    newGraph: PipelineGraph,
+    oldScene?: Scene,
+    newScene?: Scene,
+  ): void {
+    const newAssetIds = this.collectAssetIds(newGraph, newScene)
+    const oldAssetIds = this.collectAssetIds(oldGraph, oldScene)
 
     // release = old - new（destroy + 移除）
     this.releaseAssets(oldAssetIds, newAssetIds)
 
     // 旧 graph 的 UniformBuffer 实例一刀切释放（per-RO per-pipeline）
-    for (const ro of this.iterRenderObjects(oldGraph)) {
+    for (const ro of this.iterRenderObjects(oldScene)) {
       const roBucket = this.uniformBufferCache.get(ro.id)
       if (roBucket) {
         for (const inst of roBucket.values()) {
           inst.gpuBuffer.destroy()
         }
         this.uniformBufferCache.delete(ro.id)
+      }
+    }
+
+    // 旧 graph 的全局 UniformBuffer 一刀切释放（per-pipeline，所有 RO 共享）
+    // 按 pipeline.id 索引：旧 graph 的 pipeline 不在新 graph 中时释放对应 global buffer
+    const newPipelineIds = new Set(newGraph.nodes.map((n) => n.pipeline.id))
+    for (const node of oldGraph.nodes) {
+      const pid = node.pipeline.id
+      if (!newPipelineIds.has(pid)) {
+        const inst = this.globalUniformBufferCache.get(pid)
+        if (inst) {
+          inst.gpuBuffer.destroy()
+          this.globalUniformBufferCache.delete(pid)
+        }
       }
     }
 
@@ -529,8 +680,8 @@ export class Renderer {
     }
   }
 
-  /** 收集 graph 引用的所有资产 id（model/pipeline；Material 不再有 GPU 资源） */
-  private collectAssetIds(graph: PipelineGraph): {
+  /** 收集 graph + scene 引用的所有资产 id（model/pipeline；Material 不再有 GPU 资源） */
+  private collectAssetIds(graph: PipelineGraph, scene?: Scene): {
     models: Set<string>
     pipelines: Set<string>
   } {
@@ -538,7 +689,9 @@ export class Renderer {
     const pipelines = new Set<string>()
     for (const node of graph.nodes) {
       pipelines.add(node.pipeline.id)
-      for (const ro of node.renderObjects) {
+    }
+    if (scene) {
+      for (const ro of scene.renderObjects) {
         models.add(ro.model.id)
       }
     }
@@ -568,10 +721,10 @@ export class Renderer {
     }
   }
 
-  /** 遍历 graph 中所有 RenderObject（用于 uniform 释放） */
-  private *iterRenderObjects(graph: PipelineGraph): Generator<RenderObject> {
-    for (const node of graph.nodes) {
-      for (const ro of node.renderObjects) {
+  /** 遍历 scene 中所有 RenderObject（用于 uniform 释放） */
+  private *iterRenderObjects(scene?: Scene): Generator<RenderObject> {
+    if (scene) {
+      for (const ro of scene.renderObjects) {
         yield ro
       }
     }
@@ -583,6 +736,7 @@ export class Renderer {
     encoder: GPUCommandEncoder,
     edgeIndex: Map<string, { attachment: string }>,
     graph: PipelineGraph,
+    renderObjects: RenderObject[],
   ): void {
     const gpuPipeline = this.compilePipeline(node.pipeline)
 
@@ -618,21 +772,33 @@ export class Renderer {
     })
     pass.setPipeline(gpuPipeline.pipeline)
 
+    // 全局 UniformBuffer（scope='global'，如 viewProjection）：同 pass 所有 RO 共享，
+    // 在 RO 循环外创建一次。每帧按 scene.camera 算 VP 写入。
+    const globalUniformBuffer = this.ensureGlobalUniformBuffer(node.pipeline)
+
     // 对每个 RenderObject：构建 bindGroup（合并 UniformBuffer + edge texture + sampler）+ setVertexBuffer + drawIndexed
-    for (const ro of node.renderObjects) {
+    for (const ro of renderObjects) {
       const gpuModel = this.compileModel(ro.model)
 
       // 收集所有 binding 资源（uniform-buffer + sampled-texture + sampler）到一个 bindGroup（@group(0)）
       if (gpuPipeline.bindGroupLayout) {
-        // 确保 UniformBuffer 实例存在 + 写入最新数据（懒初始化 + 每帧更新可变字段）
-        const uniformBuffer = this.ensureUniformBuffer(ro, node.pipeline)
+        // 确保 per-RO UniformBuffer 实例存在 + 写入最新可变字段（scope='instance'，如 modelMatrix）
+        const instanceUniformBuffer = this.ensureUniformBuffer(ro, node.pipeline)
         const entries: GPUBindGroupEntry[] = []
         for (const b of node.pipeline.bindings) {
           if (b.kind === 'uniform-buffer') {
-            if (!uniformBuffer) {
-              throw new Error(`[renderer] 节点 "${node.name}" pipeline "${node.pipeline.id}" 声明 uniform binding ${b.binding} 但 uniformBufferLayout 为空`)
+            const scope = b.scope ?? 'instance'
+            if (scope === 'global') {
+              if (!globalUniformBuffer) {
+                throw new Error(`[renderer] 节点 "${node.name}" pipeline "${node.pipeline.id}" 声明 global uniform binding ${b.binding} 但无 global uniformBufferLayout`)
+              }
+              entries.push({ binding: b.binding, resource: { buffer: globalUniformBuffer.gpuBuffer } })
+            } else {
+              if (!instanceUniformBuffer) {
+                throw new Error(`[renderer] 节点 "${node.name}" pipeline "${node.pipeline.id}" 声明 instance uniform binding ${b.binding} 但 uniformBufferLayout 为空`)
+              }
+              entries.push({ binding: b.binding, resource: { buffer: instanceUniformBuffer.gpuBuffer } })
             }
-            entries.push({ binding: b.binding, resource: { buffer: uniformBuffer.gpuBuffer } })
           } else if (b.kind === 'sampled-texture') {
             // 边输入：从 edgeIndex 找到对应的 from attachment
             const edgeKey = `${node.name}::${b.binding}`
@@ -699,6 +865,18 @@ export class Renderer {
       }
     }
     this.uniformBufferCache.clear()
+
+    // globalUniformBufferCache：per-pipeline 全局 uniform buffer（所有 RO 共享）
+    for (const inst of this.globalUniformBufferCache.values()) {
+      inst.gpuBuffer.destroy()
+    }
+    this.globalUniformBufferCache.clear()
+
+    // viewMatrix/projectionMatrix：仅持有 Float32Array 引用，无 GPU 资源，置 null 即可
+    this.viewMatrix = null
+    this.projectionMatrix = null
+    this.activeGraph = null
+    this.activeScene = null
 
     // pipeline/shaderModule 由 device 销毁时自动释放（不显式 destroy）
     this.pipelineCache.clear()

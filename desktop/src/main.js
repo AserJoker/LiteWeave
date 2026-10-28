@@ -36,6 +36,8 @@ import { createProjectManager, PROJECT_PACKAGE_EXT } from './projectManager.js'
 import { createRunnerWindowManager } from './runnerWindowManager.js'
 // 内嵌 MCP server：Electron 主进程提供 HTTP /mcp（relay 转发目标），命令经 onCommand 推给渲染进程
 import { LiteweaveMcpServer, createMcpHttpHandler } from '../dist/services.mjs'
+// 脚本宿主（主进程跑脚本 + tick + 推 dirty 给 Runner；见 docs/design/script-host-main-process.md）
+import { createScriptHost } from '../dist/scriptHost.mjs'
 import { z } from 'zod'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -294,6 +296,7 @@ async function onMcpCommand(command, args) {
             bootstrap.projectRoot = found.project.path
             bootstrap.projectName = bootstrap.projectName ?? found.project.name
             bootstrap.entryScene = bootstrap.entryScene ?? (found.project.entry || undefined)
+            bootstrap.entryScript = bootstrap.entryScript ?? (found.project.entryScript || undefined)
           }
         } catch (err) {
           console.warn('[mcp] runner:start 通过 projectId 补全 bootstrap 失败:', err.message)
@@ -828,6 +831,9 @@ const runnerManager = createRunnerWindowManager({
   },
 })
 
+/** 脚本宿主实例（按需创建：runner:start 时 new，stop 时 dispose） */
+let scriptHost = null
+
 // 启动 Runner（IDE / MCP 调用）
 ipcMain.handle('runner:start', async (_event, payload) => {
   try {
@@ -840,12 +846,31 @@ ipcMain.handle('runner:start', async (_event, payload) => {
           bootstrap.projectRoot = found.project.path
           bootstrap.projectName = bootstrap.projectName ?? found.project.name
           bootstrap.entryScene = bootstrap.entryScene ?? (found.project.entry || undefined)
+          bootstrap.entryScript = bootstrap.entryScript ?? (found.project.entryScript || undefined)
         }
       } catch (err) {
         console.warn('[runner] 通过 projectId 补全 bootstrap 失败:', err.message)
       }
     }
+    // 旧 scriptHost 先停（单例语义）
+    if (scriptHost) {
+      try { scriptHost.stop() } catch {}
+      scriptHost = null
+    }
     await runnerManager.start(bootstrap)
+    // 创建 scriptHost：主进程加载 Scene + 跑脚本 + tick + 推 dirty 给 Runner
+    // Runner ready 后（runner:ready IPC）scriptHost.handleRunnerReady 推 scene-ready + 启 tick
+    scriptHost = createScriptHost({
+      projectRoot: bootstrap.projectRoot,
+      projectId: bootstrap.projectId,
+      projectName: bootstrap.projectName ?? bootstrap.projectId,
+      entryScene: bootstrap.entryScene,
+      entryScript: bootstrap.entryScript,
+      runnerManager: {
+        sendToRunner: (event) => runnerManager.sendToRunner(event),
+      },
+    })
+    await scriptHost.start()
     return { ok: true, status: runnerManager.getStatus() }
   } catch (err) {
     console.error('[runner] start 失败:', err)
@@ -856,6 +881,10 @@ ipcMain.handle('runner:start', async (_event, payload) => {
 // 停止 Runner
 ipcMain.handle('runner:stop', async () => {
   try {
+    if (scriptHost) {
+      try { scriptHost.stop() } catch {}
+      scriptHost = null
+    }
     await runnerManager.stop()
     return { ok: true }
   } catch (err) {
@@ -866,6 +895,10 @@ ipcMain.handle('runner:stop', async () => {
 // 重载 Runner（保留窗口，重新加载页面）
 ipcMain.handle('runner:reload', async () => {
   try {
+    // scriptHost 先重载脚本（推 reload 给 Runner + 重推 scene-ready + 重启 tick）
+    if (scriptHost) {
+      await scriptHost.reload()
+    }
     await runnerManager.reload()
     return { ok: true, status: runnerManager.getStatus() }
   } catch (err) {
@@ -878,9 +911,13 @@ ipcMain.handle('runner:status', () => {
   return runnerManager.getStatus()
 })
 
-// Runner → 主进程：报告就绪
-ipcMain.handle('runner:ready', async () => {
+// Runner → 主进程：报告就绪（含 canvas 尺寸，scriptHost 据此推 scene-ready + 启 tick）
+ipcMain.handle('runner:ready', async (_event, payload) => {
   runnerManager.markReady()
+  // 通知 scriptHost：Runner WebGPU 就绪，推 scene-ready + 启 tick
+  if (scriptHost && payload?.canvasSize) {
+    scriptHost.handleRunnerReady(payload.canvasSize)
+  }
   return { ok: true }
 })
 
@@ -920,6 +957,29 @@ ipcMain.handle('runner:send-event', async (_event, payload) => {
   return { ok: true }
 })
 
+// Runner → 主进程：读取项目内资产文件文本（AssetLoader 的 fs 适配器后端）
+// Runner 渲染进程无 Node fs 权限（contextIsolation），统一经主进程读项目目录文件。
+// payload: { projectRoot, relativePath } → { content } 或 { error }
+ipcMain.handle('runner:read-asset', async (_event, payload) => {
+  try {
+    const projectRoot = payload?.projectRoot
+    const relativePath = payload?.relativePath
+    if (typeof projectRoot !== 'string' || typeof relativePath !== 'string') {
+      return { error: 'invalid payload (projectRoot/relativePath required)' }
+    }
+    // 防路径穿越：相对路径必须在项目根下
+    const abs = path.resolve(projectRoot, relativePath)
+    const rel = path.relative(projectRoot, abs)
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      return { error: `path escapes project root: ${relativePath}` }
+    }
+    const content = await fs.readFile(abs, 'utf8')
+    return { content }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+})
+
 // 退出前关闭服务层 + MCP HTTP server（等待持久化写盘 + 释放事件循环引用）
 // 关键：所有异步清理完成后用 app.exit(0) 强制退出，避免遗漏的 handle（如未关闭的
 // EventEmitter、定时器、CDP 端口等）持有事件循环导致主进程挂起不退。
@@ -949,4 +1009,6 @@ app.on('window-all-closed', () => {
 // dev 模式开启远程调试端口，供 chrome-devtools MCP 连接
 if (isDev) {
   app.commandLine.appendSwitch('remote-debugging-port', '9222')
+  // 允许任意 origin 连 CDP（python websocket-client / chrome-devtools MCP 等）
+  app.commandLine.appendSwitch('remote-allow-origins', '*')
 }

@@ -1,31 +1,31 @@
 /**
- * Runner 渲染进程入口 —— 引擎业务层的承载窗口。
+ * LiteWeave Runner —— 纯渲染器（第一阶段：消费主进程推送的渲染数据）。
  *
- * 定位（见 docs/design/monaco-tsserver.md §10 双窗口模型）：
- * - IDE 进程只编辑 + 静态预览（renderSceneOnce）
- * - Runner 独立 Electron 进程跑脚本 + 主循环（崩溃不影响 IDE）
+ * 定位（见 docs/design/script-host-main-process.md §第一阶段）：
+ * - Runner 是纯渲染器 + 输入采集（第一阶段不做输入）
+ * - 主进程（scriptHost）加载 Scene + 跑脚本 + tick + 推 dirty
+ * - Runner 消费 scene-ready（建 GPU 资源）+ tick-delta（应用 dirty）+ script-error（显示错误态）
+ * - 渲染循环（rAF）独立于主进程 tick；resize 本地兜底重算 projection
  *
- * 当前阶段（引擎层重构后）：
- * - 引擎业务层（@liteweave/engine）提供 Renderer + 数据描述对象
- * - Runner 只负责：WebGPU 设备初始化 + canvas 配置 + 调 renderer.renderGraph(graph) + 状态上报
- * - 渲染流程描述（立方体场景）从 engine 导入（buildCubeScene）
- *
- * 通讯契约（preload 暴露 window.liteweaveRunner）：
- * - invoke(channel, payload?) → 调主进程 runner:* IPC
- * - onEvent(cb) → 订阅主进程推过来的 runner 事件（IDE→Runner 指令转发等）
- * - getBootstrap() → 取启动时主进程注入的项目/入口信息
+ * 通讯（preload 暴露 window.liteweaveRunner）：
+ *   Runner ──invoke──► 主进程：runner:ready（含 canvasSize）/ runner:heartbeat / runner:console
+ *   主进程 ──onEvent──► Runner：scene-ready / tick-delta / script-error / reload / stop
  */
+import { Renderer, type Scene, type RenderObject, type PipelineGraph, type Camera as CameraDesc } from '@liteweave/engine'
+import { mat4 } from 'gl-matrix'
 import './runner.css'
-import { getGpuDevice, getAdapterInfo, configureCanvas, resizeCanvasToDisplaySize, type GpuDeviceHandle } from './webgpuHelpers.js'
-import { Renderer, buildCubeScene, updateCubeMvp } from '@liteweave/engine'
+import {
+  getGpuDevice,
+  getAdapterInfo,
+  configureCanvas,
+  resizeCanvasToDisplaySize,
+  type GpuDeviceHandle,
+} from './webgpuHelpers.js'
 
 /** Runner preload 暴露的桥（与 desktop/src/runnerPreload.cjs 契约一致） */
 interface RunnerBridge {
-  /** 命令式调用主进程 runner IPC（如 'runner:ready'） */
   invoke<T = unknown>(channel: string, payload?: unknown): Promise<T>
-  /** 订阅主进程推送的 runner 事件（IDE→Runner 指令转发等） */
   onEvent(cb: (event: { type: string; payload?: unknown }) => void): () => void
-  /** 获取启动时主进程注入的项目/入口信息 */
   getBootstrap(): {
     projectRoot: string
     projectId: string
@@ -40,6 +40,34 @@ function getBridge(): RunnerBridge | undefined {
   return w.liteweaveRunner
 }
 
+/** 主进程推送的 scene-ready payload（TypedArray 已序列化为 number[]） */
+interface SceneReadyPayload {
+  type: 'scene-ready'
+  graph: PipelineGraph
+  renderObjects: Array<{
+    id: number
+    model: {
+      id: string
+      vertices: number[]
+      indices: number[]
+      vertexLayouts: RenderObject['model']['vertexLayouts']
+    }
+    material: RenderObject['material']
+    pipelineBindings: RenderObject['pipelineBindings']
+    initialFieldValues: Record<string, number[]>
+  }>
+  camera: CameraDesc
+  canvasSize: { width: number; height: number }
+}
+
+/** 主进程推送的 tick-delta payload */
+interface TickDeltaPayload {
+  type: 'tick-delta'
+  tickCount: number
+  dirtyFields: Array<{ roId: number; fieldName: string; value: number[] }>
+  camera: { view: number[]; projection: number[] } | null
+}
+
 interface RunnerState {
   status: 'initializing' | 'ready' | 'running' | 'stopped' | 'error'
   project?: { id: string; name: string; root: string }
@@ -47,21 +75,13 @@ interface RunnerState {
   lastError?: string
   heartbeatCount: number
   lastEvent?: { type: string; at: string }
-  /** GPU 设备信息（getGpuDevice 成功后填充；卡片显示用） */
   gpu?: { vendor: string; architecture: string; description: string; format: string }
-  /** canvas 物理分辨率（resize 时更新；卡片显示用） */
   canvasSize?: { width: number; height: number; dpr: number }
-  /** 渲染帧计数（每 60 帧更新一次显示） */
   frameCount: number
 }
 
 const root = document.getElementById('runner-root')!
 
-/**
- * 一次性建立骨架 DOM：canvas-pane（含 canvas，固定不重渲染）+ info-pane（render 目标）。
- * 关键：canvas 元素一旦创建就不再被 innerHTML 覆盖（重渲染只更新 info-pane），
- * 否则每次 render 会销毁 canvas 重建，WebGPU context 丢失 + ResizeObserver 失效。
- */
 function buildSkeleton() {
   root.innerHTML = `
     <div class="lwrunner-card lwrunner-card-split">
@@ -112,7 +132,6 @@ function render(state: RunnerState) {
     ? `<div class="lwrunner-row"><span class="lwrunner-label">分辨率</span><span class="lwrunner-value" data-runner-field="canvas-size"><code>${state.canvasSize.width}×${state.canvasSize.height}</code> @ ${state.canvasSize.dpr}x</span></div>`
     : ''
 
-  // 只更新 info-pane（canvas-pane 在骨架中固定，不参与重渲染）
   infoPane.innerHTML = `
     <header class="lwrunner-header">
       <h1>LiteWeave Runner</h1>
@@ -132,15 +151,14 @@ function render(state: RunnerState) {
       <div class="lwrunner-row"><span class="lwrunner-label">最近事件</span><span class="lwrunner-value" data-runner-field="last-event">${state.lastEvent ? escapeHtml(state.lastEvent.type) + ' @ ' + escapeHtml(state.lastEvent.at) : '—'}</span></div>
     </section>
     <footer class="lwrunner-footer">
-      引擎业务层（@liteweave/engine）已接入：Renderer + PipelineGraph 双 pass 立方体。
+      Runner 纯渲染器：主进程跑脚本 + 推 dirty，前端消费渲染。
     </footer>
   `
 
-  // canvas overlay 状态徽章单独更新（不在 infoPane 内）
   const overlayStatus = root.querySelector('[data-runner-field="overlay-status"]')
   if (overlayStatus) {
     overlayStatus.setAttribute('style', `color:${statusColor}`)
-    overlayStatus.textContent = `● ${state.status}`
+    overlayStatus.textContent = state.status
   }
 }
 
@@ -155,6 +173,7 @@ function escapeHtml(s: string): string {
 }
 
 const state: RunnerState = { status: 'initializing', heartbeatCount: 0, frameCount: 0 }
+
 render(state)
 
 const bridge = getBridge()
@@ -164,7 +183,7 @@ if (!bridge) {
   state.lastError = 'window.liteweaveRunner 不可用（preload 未注入）'
   render(state)
 } else {
-  // 1) 读取启动时主进程注入的项目/入口信息
+  // 1) 读取启动时主进程注入的项目/入口信息（仅用于卡片显示）
   const bootstrap = bridge.getBootstrap()
   if (bootstrap) {
     state.project = { id: bootstrap.projectId, name: bootstrap.projectName, root: bootstrap.projectRoot }
@@ -173,7 +192,7 @@ if (!bridge) {
     state.lastError = '主进程未注入 bootstrap 信息'
   }
 
-  // 2) 初始化 WebGPU 设备（异步；失败时状态置 error 并显示原因）
+  // 2) 初始化 WebGPU 设备
   let gpuHandle: GpuDeviceHandle | null = null
   try {
     gpuHandle = await getGpuDevice()
@@ -189,7 +208,6 @@ if (!bridge) {
     state.status = 'error'
     state.lastError = `WebGPU 初始化失败: ${err instanceof Error ? err.message : String(err)}`
     render(state)
-    void bridge.invoke('runner:ready', { at: new Date().toISOString(), gpuReady: false }).catch(() => {})
   }
 
   if (gpuHandle) {
@@ -197,24 +215,224 @@ if (!bridge) {
   }
   render(state)
 
-  // 3) 通知主进程：Runner 已就绪
-  void bridge.invoke('runner:ready', { at: new Date().toISOString(), gpuReady: !!gpuHandle }).catch((err) => {
+  // 3) 通知主进程：Runner 已就绪（含 canvas 尺寸，scriptHost 据此推 scene-ready + 启 tick）
+  const canvas0 = document.getElementById('runner-canvas') as HTMLCanvasElement | null
+  const initialCanvasSize = canvas0
+    ? { width: canvas0.width || 300, height: canvas0.height || 150 }
+    : { width: 300, height: 150 }
+  void bridge.invoke('runner:ready', { at: new Date().toISOString(), gpuReady: !!gpuHandle, canvasSize: initialCanvasSize }).catch((err) => {
     console.error('[runner] runner:ready 失败:', err)
   })
 
-  // 4) 订阅主进程推送的 runner 事件
+  // 4) 订阅主进程推送的 runner 事件（scene-ready / tick-delta / script-error / reload / stop）
+  let scene: Scene | null = null
+  let renderer: Renderer | null = null
+  let rafId: number | null = null
+  let lastAspect = 0
+  const roIndex = new Map<number, RenderObject>()
+
   bridge.onEvent((event) => {
     state.lastEvent = { type: event.type, at: new Date().toISOString() }
-    if (event.type === 'reload') {
+
+    if (event.type === 'scene-ready') {
+      handleSceneReady(event as SceneReadyPayload)
+    } else if (event.type === 'tick-delta') {
+      handleTickDelta(event as TickDeltaPayload)
+    } else if (event.type === 'script-error') {
+      const p = event as { message?: string }
+      state.status = 'error'
+      state.lastError = p?.message ?? '脚本运行时错误'
+      render(state)
+    } else if (event.type === 'reload') {
       state.status = 'initializing'
-      state.heartbeatCount = 0
+      state.lastError = undefined
+      state.frameCount = 0
+      stopLoop()
+      render(state)
     } else if (event.type === 'stop') {
       state.status = 'stopped'
-    } else if (event.type === 'run') {
-      state.status = 'running'
+      stopLoop()
+      render(state)
     }
-    render(state)
   })
+
+  /** 处理 scene-ready：重建 Scene 对象 + 编译 pipeline + 建 GPU 资源 + 启渲染循环 */
+  function handleSceneReady(payload: SceneReadyPayload) {
+    if (!gpuHandle) {
+      console.error('[runner] scene-ready 但 WebGPU 未就绪')
+      return
+    }
+    const canvas = document.getElementById('runner-canvas') as HTMLCanvasElement | null
+    if (!canvas) {
+      state.lastError = '未找到 #runner-canvas 元素'
+      render(state)
+      return
+    }
+
+    try {
+      const ctx = configureCanvas(canvas, gpuHandle.device, gpuHandle.format)
+      console.log('[runner] canvas WebGPU context 已配置')
+
+      // 同步 canvas 物理尺寸
+      const syncCanvasSize = () => {
+        const dpr = window.devicePixelRatio || 1
+        state.canvasSize = { width: canvas.width, height: canvas.height, dpr }
+        const node = root.querySelector('[data-runner-field="canvas-size"]')
+        if (node) {
+          node.innerHTML = `<code>${state.canvasSize.width}×${state.canvasSize.height}</code> @ ${dpr}x`
+        } else {
+          render(state)
+        }
+      }
+      if (canvas.clientWidth > 0 && canvas.clientHeight > 0) {
+        resizeCanvasToDisplaySize(canvas)
+        syncCanvasSize()
+      }
+      const ro = new ResizeObserver(() => {
+        resizeCanvasToDisplaySize(canvas)
+        syncCanvasSize()
+      })
+      ro.observe(canvas)
+      setTimeout(() => {
+        if (canvas.width === 300 && canvas.height === 150 && canvas.clientWidth > 0) {
+          resizeCanvasToDisplaySize(canvas)
+          syncCanvasSize()
+        }
+      }, 100)
+
+      renderer = new Renderer({
+        device: gpuHandle.device,
+        ctx,
+        swapchainFormat: gpuHandle.format,
+      })
+
+      // 重建 Scene 对象（从 payload 反序列化；Renderer.renderGraph 需要 Scene）
+      const renderObjects: RenderObject[] = payload.renderObjects.map((roData) => ({
+        id: roData.id,
+        model: {
+          id: roData.model.id,
+          vertices: new Float32Array(roData.model.vertices),
+          indices: roData.model.indices.length > 0 ? new Uint16Array(roData.model.indices) : undefined,
+          vertexLayouts: roData.model.vertexLayouts,
+        },
+        material: roData.material,
+        fieldValues: new Map(
+          Object.entries(roData.initialFieldValues).map(([k, v]) => [k, new Float32Array(v)]),
+        ),
+        pipelineBindings: roData.pipelineBindings,
+      }))
+      for (const ro of renderObjects) {
+        roIndex.set(ro.id, ro)
+      }
+      scene = {
+        id: payload.graph.id ?? 'scene-from-main',
+        graph: payload.graph,
+        camera: payload.camera,
+        renderObjects,
+      }
+      console.log(`[runner] Scene 已从主进程推送重建（${renderObjects.length} 个 RO）`)
+
+      // 用初始 camera 算 view/projection 同步给 Renderer
+      const cam = payload.camera
+      const aspect = canvas.width / Math.max(1, canvas.height)
+      const view = mat4.create()
+      mat4.lookAt(view, cam.position, cam.target, cam.up)
+      const projection = mat4.create()
+      mat4.perspective(projection, cam.fov, aspect, cam.near, cam.far)
+      renderer.setView(view as Float32Array)
+      renderer.setProjection(projection as Float32Array)
+      lastAspect = aspect
+
+      // 编译 pipeline（提前触发 + validation 检查）
+      gpuHandle.device.pushErrorScope('validation')
+      try {
+        for (const node of payload.graph.nodes) {
+          renderer.compilePipeline(node.pipeline)
+        }
+      } catch (err) {
+        gpuHandle.device.popErrorScope().catch(() => {})
+        throw err
+      }
+      gpuHandle.device.popErrorScope().then((pipelineError) => {
+        if (pipelineError) {
+          console.error('[runner] pipeline validation 失败:', pipelineError.message)
+          state.status = 'error'
+          state.lastError = `pipeline validation 失败: ${pipelineError.message}`
+          render(state)
+        } else {
+          console.log('[runner] 所有 pipeline 编译通过')
+        }
+      })
+
+      // 启动渲染循环
+      state.status = 'running'
+      render(state)
+      startRenderLoop(canvas, renderer, scene)
+      void bridge.invoke('runner:report-status', { status: 'running' }).catch(() => {})
+      console.log('[runner] 渲染循环已启动（纯渲染器模式）')
+    } catch (err) {
+      state.status = 'error'
+      state.lastError = `scene-ready 处理失败: ${err instanceof Error ? err.message : String(err)}`
+      render(state)
+      console.error('[runner] scene-ready 失败:', err)
+    }
+  }
+
+  /** 处理 tick-delta：应用 dirty 字段 + camera 矩阵 */
+  function handleTickDelta(payload: TickDeltaPayload) {
+    if (!scene) return
+    for (const change of payload.dirtyFields) {
+      const ro = roIndex.get(change.roId)
+      if (!ro) {
+        console.warn(`[runner] tick-delta: 未找到 RO id=${change.roId}`)
+        continue
+      }
+      ro.fieldValues.set(change.fieldName, new Float32Array(change.value))
+    }
+    if (payload.camera && renderer) {
+      renderer.setView(new Float32Array(payload.camera.view))
+      renderer.setProjection(new Float32Array(payload.camera.projection))
+    }
+  }
+
+  /** 渲染循环（rAF） */
+  function startRenderLoop(canvas: HTMLCanvasElement, r: Renderer, sc: Scene) {
+    const frame = () => {
+      // 同步 canvas 物理尺寸到 Renderer（attachment 按 currentWidth/Height 创建；
+      // resize 内部有尺寸比较，没变化直接返回 false，零开销）
+      r.resize(canvas.width, canvas.height)
+      // resize 兜底：aspect 变化时本地重算 projection（与 v0.1 一致；不推主进程）
+      const newAspect = canvas.width / Math.max(1, canvas.height)
+      if (newAspect !== lastAspect) {
+        const projection = mat4.create()
+        mat4.perspective(projection, sc.camera.fov, newAspect, sc.camera.near, sc.camera.far)
+        r.setProjection(projection as Float32Array)
+        lastAspect = newAspect
+        console.log(`[runner] aspect 变化: ${newAspect.toFixed(3)} → projection 本地重算`)
+      }
+      r.renderGraph(sc.graph, sc)
+      state.frameCount += 1
+      if (state.frameCount % 60 === 0) {
+        const node = root.querySelector('[data-runner-field="frame-count"]')
+        if (node) node.textContent = String(state.frameCount)
+      }
+      rafId = requestAnimationFrame(frame)
+    }
+    rafId = requestAnimationFrame(frame)
+  }
+
+  function stopLoop() {
+    if (rafId !== null) {
+      cancelAnimationFrame(rafId)
+      rafId = null
+    }
+    if (renderer) {
+      renderer.dispose()
+      renderer = null
+    }
+    scene = null
+    roIndex.clear()
+  }
 
   // 5) 心跳：每 2s 上报一次
   setInterval(() => {
@@ -224,137 +442,5 @@ if (!bridge) {
     if (node) node.textContent = String(state.heartbeatCount)
   }, 2000)
 
-  // 6) canvas 配置 + Renderer + 渲染循环
-  if (gpuHandle) {
-    const canvas = document.getElementById('runner-canvas') as HTMLCanvasElement | null
-    if (canvas) {
-      try {
-        const ctx = configureCanvas(canvas, gpuHandle.device, gpuHandle.format)
-        console.log('[runner] canvas WebGPU context 已配置')
-
-        // 同步 canvas 物理尺寸到状态卡片
-        const syncCanvasSize = () => {
-          const dpr = window.devicePixelRatio || 1
-          state.canvasSize = {
-            width: canvas.width,
-            height: canvas.height,
-            dpr,
-          }
-          const node = root.querySelector('[data-runner-field="canvas-size"]')
-          if (node) {
-            node.innerHTML = `<code>${state.canvasSize.width}×${state.canvasSize.height}</code> @ ${dpr}x`
-          } else {
-            render(state)
-          }
-        }
-
-        // 首次同步：gpuHandle 块在 await 后执行，此时 buildSkeleton 已同步完成且 layout 通常已稳定
-        if (canvas.clientWidth > 0 && canvas.clientHeight > 0) {
-          resizeCanvasToDisplaySize(canvas)
-          syncCanvasSize()
-        }
-
-        // ResizeObserver：后续容器尺寸变化 → 同步物理像素 → 下一帧 getCurrentTexture 自动新尺寸
-        const ro = new ResizeObserver(() => {
-          resizeCanvasToDisplaySize(canvas)
-          syncCanvasSize()
-        })
-        ro.observe(canvas)
-
-        // 兜底：首次同步时 layout 尚未稳定（clientWidth=0），用 setTimeout 延迟重试
-        setTimeout(() => {
-          if (canvas.width === 300 && canvas.height === 150 && canvas.clientWidth > 0) {
-            resizeCanvasToDisplaySize(canvas)
-            syncCanvasSize()
-          }
-        }, 100)
-
-        // 创建 Renderer + 构建立方体场景
-        const renderer = new Renderer({
-          device: gpuHandle.device,
-          ctx,
-          swapchainFormat: gpuHandle.format,
-        })
-
-        const aspect = canvas.width / Math.max(1, canvas.height)
-        const { graph, cubeRenderObject } = buildCubeScene(gpuHandle.format, aspect)
-        console.log('[runner] Renderer + PipelineGraph 已构建（立方体双 pass 图）')
-
-        // 用 pushErrorScope('validation') 抓 shader/pipeline 编译期错误
-        // （Renderer 在首次 renderGraph 时才编译 pipeline；此处提前调一次 compilePipeline 触发编译）
-        gpuHandle.device.pushErrorScope('validation')
-        try {
-          for (const node of graph.nodes) {
-            renderer.compilePipeline(node.pipeline)
-          }
-        } catch (err) {
-          gpuHandle.device.popErrorScope().catch(() => {})
-          throw err
-        }
-        const pipelineError = await gpuHandle.device.popErrorScope()
-        if (pipelineError) {
-          throw new Error(`pipeline validation 失败: ${pipelineError.message}`)
-        }
-        console.log('[runner] 所有 pipeline 编译通过')
-
-        // 渲染循环（rAF）：每帧 resize 检查 → 更新 mvp（aspect 变化时）→ renderer.renderGraph
-        let rafId: number | null = null
-        let lastAspect = aspect
-        const frame = () => {
-          // 1) 尺寸检查（resize 后下一帧 getCurrentTexture 自动返回新尺寸纹理）
-          resizeCanvasToDisplaySize(canvas)
-
-          // 2) aspect 变化时更新 cubeRenderObject 的 mvp uniform
-          const newAspect = canvas.width / Math.max(1, canvas.height)
-          if (newAspect !== lastAspect) {
-            updateCubeMvp(cubeRenderObject, newAspect)
-            lastAspect = newAspect
-            console.log(`[runner] aspect 变化: ${newAspect.toFixed(3)} → mvp 已更新`)
-          }
-
-          // 3) 通知 Renderer 当前 canvas 尺寸（用于重建 size='swapchain' 的 attachment）
-          renderer.resize(canvas.width, canvas.height)
-
-          // 4) 渲染整个 PipelineGraph（Renderer 内部：ensureAttachments + 遍历 nodes + submit）
-          renderer.renderGraph(graph)
-
-          // 帧计数 + 下一帧（每 60 帧更新一次显示，避免重渲染开销）
-          state.frameCount += 1
-          if (state.frameCount % 60 === 0) {
-            const node = root.querySelector('[data-runner-field="frame-count"]')
-            if (node) node.textContent = String(state.frameCount)
-          }
-
-          rafId = requestAnimationFrame(frame)
-        }
-
-        // 状态 ready → running，启动循环
-        state.status = 'running'
-        render(state)
-        void bridge.invoke('runner:report-status', { status: 'running' }).catch((err) => {
-          console.warn('[runner] 上报 running 状态失败:', err)
-        })
-        rafId = requestAnimationFrame(frame)
-        console.log('[runner] 渲染循环已启动（@liteweave/engine Renderer）')
-
-        // 窗口关闭/unload 时停止循环 + 释放 Renderer 缓存的 GPU 资源
-        const stopLoop = () => {
-          if (rafId !== null) {
-            cancelAnimationFrame(rafId)
-            rafId = null
-          }
-          renderer.dispose()
-        }
-        window.addEventListener('beforeunload', stopLoop)
-      } catch (err) {
-        state.status = 'error'
-        state.lastError = `canvas 配置/Renderer 初始化失败: ${err instanceof Error ? err.message : String(err)}`
-        render(state)
-        console.error('[runner] canvas/Renderer 失败:', err)
-      }
-    } else {
-      state.lastError = '未找到 #runner-canvas 元素'
-      render(state)
-    }
-  }
+  window.addEventListener('beforeunload', stopLoop)
 }

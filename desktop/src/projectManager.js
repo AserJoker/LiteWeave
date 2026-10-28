@@ -215,6 +215,7 @@ function toProject(meta, projectDir) {
     namespaces: v2.namespaces,
     settings: v2.settings,
     entry: v2.entry,
+    entryScript: v2.entryScript,
     resources: v2.resources,
     languages: v2.languages,
   }

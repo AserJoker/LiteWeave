@@ -203,6 +203,17 @@ export interface ColorTargetDesc {
 export type PipelineBindingKind = 'uniform-buffer' | 'sampled-texture' | 'sampler'
 
 /**
+ * uniform-buffer binding 的作用域（决定 Renderer 用哪个 uniform buffer 填充）：
+ * - 'global'：全局 uniform（如 viewProjection），Renderer 按 scene.camera 每帧算后写入，
+ *   所有 RO 共享同一 buffer（缓存在 Renderer 上）
+ * - 'instance'：per-RO uniform（如 modelMatrix），每个 RO 各一份 buffer，
+ *   按 RO.fieldValues 经 RO.pipelineBindings 映射后写入
+ *
+ * 缺省值 'instance'（向后兼容：原单 uniform buffer 场景默认 per-RO）。
+ */
+export type UniformBufferScope = 'global' | 'instance'
+
+/**
  * Pipeline binding 描述：声明 pipeline shader 需要哪些 binding。
  * 归 Pipeline 声明（pipeline 知道自己 shader 的 binding 结构）。
  */
@@ -217,14 +228,21 @@ export interface PipelineBinding {
   bufferSize?: number
   /** sampled-texture 时的 format（用于 layout 描述） */
   textureFormat?: string
+  /** uniform-buffer 时的作用域：'global'（全局共享，如 viewProjection）| 'instance'（per-RO，如 modelMatrix）。缺省 'instance' */
+  scope?: UniformBufferScope
 }
 
 /**
  * Pipeline 的 uniform 字段定义（描述 shader uniform buffer 的内存布局）。
  * 用于 UniformBuffer 创建 + 字段 offset 计算 + 数据写入定位。
+ *
+ * scope 决定字段属于哪个 uniform buffer：
+ * - 'global'：全局 uniform buffer（如 viewProjection），Renderer 按 scene.camera 算后写入
+ * - 'instance'：per-RO uniform buffer（如 modelMatrix），按 RO.fieldValues 写入
+ * 缺省 'instance'（向后兼容）。
  */
 export interface UniformFieldSpec {
-  /** shader 中的 uniform 名（如 'mvp'、'baseColor'） */
+  /** shader 中的 uniform 名（如 'mvp'、'baseColor'、'viewProjection'、'modelMatrix'） */
   name: string
   /** 字段类型（与 WebGPU GPUVertexFormat 对齐但简化） */
   type: 'float32' | 'float32x2' | 'float32x3' | 'float32x4' | 'float32x4x4'
@@ -232,6 +250,8 @@ export interface UniformFieldSpec {
   offset: number
   /** 字段字节大小（type 对应的字节数） */
   size: number
+  /** 字段所属 uniform buffer 作用域：'global' | 'instance'。缺省 'instance' */
+  scope?: UniformBufferScope
 }
 
 /**
@@ -381,18 +401,19 @@ export interface RenderObject {
  * 字段：
  * - name：节点名（如 'cube-pass' / 'present-pass'）
  * - pipeline：本节点用的 Pipeline 描述
- * - renderObjects：本节点绘制的 RenderObject 列表
  * - colorAttachmentInputs：作为输入的颜色 attachment 名（来自前面的 pass 输出或外部）
  * - colorAttachmentOutputs：本 pass 输出的颜色 attachment 名（被后面的 pass 输入或最终输出）
  * - depthAttachment：本 pass 用的深度 attachment 名（可选）
  *
- * 关键：输入 attachment 是"读取前面 pass 输出"的语义；输出 attachment 是"写入"语义。
+ * 关键：node 不再持 renderObjects（RO 归 Scene）。Renderer 渲染某 pass 时按
+ *   `ro.material.pipelineBindings` 含 `node.pipeline.id` 筛选 Scene 中的 RO。
+ *
+ * 输入 attachment 是"读取前面 pass 输出"的语义；输出 attachment 是"写入"语义。
  * 一个 attachment 由某 pass 输出，由后续 pass 输入（作为纹理采样）—— 这就是 DAG 的边。
  */
 export interface PipelineNode {
   name: string
   pipeline: Pipeline
-  renderObjects: RenderObject[]
   /** 输入 attachment 名（作为采样纹理；最终 pass 通常输入前面的 color attachment） */
   colorAttachmentInputs: string[]
   /** 输出 attachment 名（作为 RTV 写入） */
@@ -441,4 +462,81 @@ export interface PipelineGraph {
   edges: AttachmentEdge[]
   /** 全局 attachment 声明（含 swapchain 类型的外部 attachment） */
   attachments: Attachment[]
+}
+
+/* ---------------- Scene（场景实例：graph 引用 + camera + 静态 RO 列表） ---------------- */
+
+/**
+ * Camera：场景相机描述（类型 + 初始信息）。
+ *
+ * 语义：Scene.camera 描述场景的"初始相机状态"，编辑期定义。运行时脚本会动态操作
+ * 相机（移动/旋转/改投影参数），Renderer 内部持一份可变的 currentCamera 状态对象
+ * （初始化时从 scene.camera 拷贝），脚本修改的是 currentCamera 而非 scene.camera
+ * （资产描述对象不可变，见缓存生命周期契约）。
+ *
+ * 类型与初始信息：
+ * - type='perspective'：透视投影，用 fov/aspect/near/far 算 projection 矩阵
+ * - type='orthographic'：正交投影（占位，参数待补，当前未实现）
+ *
+ * Renderer 每帧按 currentCamera 算 viewProjection 矩阵（view = lookAt(position, target, up)，
+ * projection = perspective(fov, aspect, near, far)），写入全局 uniform buffer
+ * （所有 RO 共享，@binding(0)）。RO 自己的 modelMatrix 在 @binding(1)，shader 内
+ * mvp = viewProjection * modelMatrix（GPU 相乘）。
+ *
+ * aspect 缺省时由 Renderer 用当前 canvas 物理宽高比填充（resize 时自动更新）。
+ */
+export interface Camera {
+  /** 投影类型：'perspective'（透视）| 'orthographic'（正交，占位未实现） */
+  type: 'perspective' | 'orthographic'
+  /** 相机位置（世界坐标） */
+  position: [number, number, number]
+  /** 观察目标点（世界坐标） */
+  target: [number, number, number]
+  /** 上方向（世界坐标；通常 [0,1,0]） */
+  up: [number, number, number]
+  /** 垂直视场角（弧度）；type='perspective' 时使用 */
+  fov: number
+  /** 近裁剪面距离 */
+  near: number
+  /** 远裁剪面距离 */
+  far: number
+  /** 宽高比；缺省时由 Renderer 用当前 canvas 物理宽高比填充 */
+  aspect?: number
+}
+
+/**
+ * Scene：场景实例 = 一个 PipelineGraph 引用 + camera + 若干静态 RenderObject。
+ *
+ * 职责分离（与 PipelineGraph 解耦）：
+ * - PipelineGraph 描述"怎么画"（pass 拓扑 + attachment 流动 + pipeline 选择），不含实例数据
+ * - Scene 描述"画什么"（graph 引用 + camera + RO 列表 = 几何 + 材质 + 模型变换）
+ *
+ * RO 与 pass 的关联（不显式声明 passName）：
+ * - 每个 RO 通过 material.pipelineBindings 声明自己在哪些 pipeline 可见
+ * - Renderer 渲染某 pass 时遍历 scene.renderObjects，筛出 material.pipelineBindings
+ *   含 node.pipeline.id 的 RO 在该 pass 中绘制
+ * - 这与材质三段式的 pipelineBindings 对称（材质静态字段映射 + RO 可变字段映射共用同一 key 空间）
+ *
+ * MVP 拆分（GPU 相乘）：
+ * - viewProjection 矩阵由 Renderer 按 currentCamera（初始值来自 scene.camera，脚本可改）每帧计算，
+ *   写入全局 uniform（@binding(0)）
+ * - modelMatrix 矩阵由 RO.fieldValues['modelMatrix'] 提供，写入 per-RO uniform（@binding(1)）
+ * - shader 内 mvp = viewProjection * modelMatrix（GPU 相乘）
+ *
+ * 动态 RO（脚本运行时创建/销毁）未来由脚本层直接调 renderer API 添加，不必经 Scene 资源。
+ * Scene 资源只承载静态 RO（编辑期定义的初始场景）。
+ */
+export interface Scene {
+  /**
+   * 持久化资产外部 id：`<namespace>:<path>`（如 'demogame:scenes/main.scene.json'）。
+   * 跨场景稳定，代码可硬编码。Renderer 按此 id 缓存 + 场景切换 diff 保留。
+   * 加载器必须按 id 去重，同一 id 不重复 new Scene。
+   */
+  id: string
+  /** 引用的 PipelineGraph（递归加载得到） */
+  graph: PipelineGraph
+  /** 场景相机（viewProjection 来源；Renderer 每帧按此算 VP 写全局 uniform） */
+  camera: Camera
+  /** 静态 RO 列表（编辑期定义；脚本运行时可动态增删） */
+  renderObjects: RenderObject[]
 }

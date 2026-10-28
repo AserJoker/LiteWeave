@@ -141,8 +141,18 @@ export function createRunnerWindowManager(opts) {
 
     const url = buildUrl(bootstrap)
     if (isDev) {
-      await runnerWin.loadURL(url)
-      runnerWin.webContents.openDevTools({ mode: 'detach' })
+      try {
+        await runnerWin.loadURL(url)
+      } catch (err) {
+        console.error('[runner] loadURL 失败:', err)
+        try { runnerWin?.destroy() } catch {}
+        runnerWin = null
+        throw err
+      }
+      // loadURL 期间窗口可能被关闭（closed 事件置 runnerWin=null），二次检查
+      if (runnerWin && runnerWin.webContents) {
+        runnerWin.webContents.openDevTools({ mode: 'detach' })
+      }
     } else {
       await runnerWin.loadFile(url)
     }
