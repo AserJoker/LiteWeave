@@ -21,14 +21,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const root = resolve(__dirname, '../..') // LiteWeave 根
 const outDir = resolve(__dirname, '../dist')
 const servicesOut = resolve(outDir, 'services.mjs')
-const scriptHostOut = resolve(outDir, 'scriptHost.mjs')
 
 await mkdir(outDir, { recursive: true })
 // 只删各自输出文件（不删整个 dist，避免互相覆盖）
 await rm(servicesOut, { force: true })
 await rm(`${servicesOut}.map`, { force: true })
-await rm(scriptHostOut, { force: true })
-await rm(`${scriptHostOut}.map`, { force: true })
 
 // services.mjs：第三方依赖 external（express 等运行时从 node_modules 解析）
 await build({
@@ -43,25 +40,6 @@ await build({
   logLevel: 'info',
 })
 console.log(`[build-backend] services → ${servicesOut}`)
-
-// scriptHost.mjs：把 @liteweave/engine 源码 + gl-matrix 打进 bundle
-// （engine 是 TS 源码无预编译产物，主进程不能直接 import TS；gl-matrix 纯 JS 可打进）
-await build({
-  entryPoints: [resolve(__dirname, '../src/scriptHost.ts')],
-  outfile: scriptHostOut,
-  bundle: true,
-  format: 'esm',
-  platform: 'node',
-  target: 'node22',
-  // gl-matrix 打进 bundle（纯 JS，体积小）；engine 源码也打进
-  packages: 'bundle',
-  sourcemap: true,
-  logLevel: 'info',
-  alias: {
-    '@liteweave/engine': resolve(root, 'engine/src/index.ts'),
-  },
-})
-console.log(`[build-backend] scriptHost → ${scriptHostOut}`)
 
 console.log('[build-backend] done')
 

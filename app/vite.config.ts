@@ -1,6 +1,5 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
-import { fileURLToPath } from 'node:url'
 
 // https://vite.dev/config/
 //
@@ -12,12 +11,6 @@ import { fileURLToPath } from 'node:url'
 // 生产模式 build 出两套 HTML 产物，主进程按文件路径加载。
 export default defineConfig({
   plugins: [react()],
-  resolve: {
-    alias: {
-      // @liteweave/engine workspace 直接指向源码（dev 即时生效，无需预编译）
-      '@liteweave/engine': fileURLToPath(new URL('../engine/src/index.ts', import.meta.url)),
-    },
-  },
   build: {
     rollupOptions: {
       input: {

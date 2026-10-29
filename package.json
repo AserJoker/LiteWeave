@@ -6,8 +6,7 @@
   "workspaces": [
     "app",
     "server",
-    "desktop",
-    "engine"
+    "desktop"
   ],
   "scripts": {
     "dev": "npm run dev -w app",

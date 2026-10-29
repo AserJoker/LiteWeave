@@ -1,6 +1,6 @@
 /**
- * Runner 窗口样式 —— 暗色背景，居中显示状态卡片。
- * Runner 不依赖 Blueprint（轻量独立进程，避免拖入大 CSS），自带最小化样式。
+ * Runner 窗口样式 —— 暗色背景，空页面占位。
+ * Runner 不依赖 Blueprint（轻量独立进程），自带最小化样式。
  */
 :root {
   color-scheme: dark;
@@ -18,100 +18,41 @@ html, body {
 }
 
 #runner-root {
-  /* 全屏布局：左右分栏，无外边距（Runner 窗口本身就是独立窗口） */
   display: flex;
   width: 100vw;
   height: 100vh;
   padding: 0;
   box-sizing: border-box;
-}
-
-.lwrunner-card {
-  background: #262b30;
-  border: 1px solid #383e47;
-  border-radius: 0;
-  box-shadow: none;
-}
-
-/* 左右分栏卡片：canvas 占左侧 70%，信息卡片占右侧 30% */
-.lwrunner-card-split {
-  display: flex;
-  width: 100%;
-  height: 100%;
-  flex-direction: row;
-  padding: 0;
-  border: none;
-  border-radius: 0;
-}
-
-.lwrunner-canvas-pane {
-  flex: 1 1 70%;
-  position: relative;
-  background: #000;
-  display: flex;
-  align-items: stretch;
-  justify-content: stretch;
-  min-width: 0;  /* 允许 flex 子项收缩 */
-}
-
-.lwrunner-canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
-  /* canvas 物理尺寸由 JS 控制（width/height 属性），CSS 100% 撑满容器 */
-}
-
-/* canvas 左下角状态徽章（轻量浮层，不挡视野） */
-.lwrunner-canvas-overlay {
-  position: absolute;
-  left: 12px;
-  bottom: 12px;
-  padding: 4px 10px;
-  background: rgba(28, 33, 39, 0.7);
-  border: 1px solid #383e47;
-  border-radius: 4px;
-  font-size: 12px;
-  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
-  pointer-events: none;  /* 不挡 canvas 交互（未来相机控制等） */
-  backdrop-filter: blur(4px);
-}
-
-.lwrunner-info-pane {
-  flex: 0 0 320px;
-  padding: 20px 22px;
-  background: #262b30;
-  border-left: 1px solid #383e47;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-}
-
-.lwrunner-header {
-  display: flex;
   align-items: center;
-  padding-bottom: 14px;
-  border-bottom: 1px solid #383e47;
-  margin-bottom: 14px;
+  justify-content: center;
 }
 
-.lwrunner-header h1 {
-  margin: 0;
-  font-size: 18px;
+.lwrunner-empty {
+  width: 480px;
+  max-width: 90vw;
+  padding: 32px;
+  background: #262b30;
+  border: 1px solid #383e47;
+  border-radius: 6px;
+}
+
+.lwrunner-empty h1 {
+  margin: 0 0 8px 0;
+  font-size: 20px;
   font-weight: 600;
   letter-spacing: 0.02em;
 }
 
-.lwrunner-status {
-  font-size: 13px;
-  font-weight: 500;
-  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+.lwrunner-muted {
+  color: #8b95a5;
+  font-style: italic;
+  margin: 0 0 20px 0;
 }
 
-.lwrunner-section {
+.lwrunner-bootstrap {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-bottom: 16px;
+  gap: 10px;
 }
 
 .lwrunner-row {
@@ -143,20 +84,6 @@ html, body {
   border-radius: 3px;
 }
 
-.lwrunner-muted {
-  color: #6b7280;
-  font-style: italic;
-}
-
-.lwrunner-error .lwrunner-value {
+.lwrunner-error {
   color: #f55656;
-}
-
-.lwrunner-footer {
-  margin-top: 8px;
-  padding-top: 14px;
-  border-top: 1px dashed #383e47;
-  font-size: 12px;
-  color: #8b95a5;
-  line-height: 1.5;
 }

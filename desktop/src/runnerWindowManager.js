@@ -190,6 +190,10 @@ export function createRunnerWindowManager(opts) {
     } else {
       await runnerWin.loadFile(url)
     }
+    // loadURL 后 compositor 处于待激活态，requestAnimationFrame 不会被自动调度
+    // （document.hidden=false + backgroundThrottling:false 都不能避免），
+    // 必须主动 invalidate 触发一次重绘信号，否则渲染循环永远起不来（frameCount 卡 0）。
+    runnerWin.webContents.invalidate()
   }
 
   /** Runner → 主进程：报告就绪 */

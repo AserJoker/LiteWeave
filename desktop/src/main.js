@@ -36,8 +36,6 @@ import { createProjectManager, PROJECT_PACKAGE_EXT } from './projectManager.js'
 import { createRunnerWindowManager } from './runnerWindowManager.js'
 // 内嵌 MCP server：Electron 主进程提供 HTTP /mcp（relay 转发目标），命令经 onCommand 推给渲染进程
 import { LiteweaveMcpServer, createMcpHttpHandler } from '../dist/services.mjs'
-// 脚本宿主（主进程跑脚本 + tick + 推 dirty 给 Runner；见 docs/design/script-host-main-process.md）
-import { createScriptHost } from '../dist/scriptHost.mjs'
 import { z } from 'zod'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -286,24 +284,10 @@ const MCP_COMMANDS = [
 async function onMcpCommand(command, args) {
   // Runner 命令：主进程直连 RunnerWindowManager
   if (command === 'system.runner:start') {
-    // 直接调 runnerManager.start，与 IPC runner:start 同语义
+    // 与 IPC runner:start 同语义：启 Runner 窗口
     try {
-      const bootstrap = args ?? {}
-      if (!bootstrap.projectRoot && bootstrap.projectId) {
-        try {
-          const found = await projectManager.readMetaConfig(bootstrap.projectId)
-          if (found?.project) {
-            bootstrap.projectRoot = found.project.path
-            bootstrap.projectName = bootstrap.projectName ?? found.project.name
-            bootstrap.entryScene = bootstrap.entryScene ?? (found.project.entry || undefined)
-            bootstrap.entryScript = bootstrap.entryScript ?? (found.project.entryScript || undefined)
-          }
-        } catch (err) {
-          console.warn('[mcp] runner:start 通过 projectId 补全 bootstrap 失败:', err.message)
-        }
-      }
-      await runnerManager.start(bootstrap)
-      return JSON.stringify(runnerManager.getStatus())
+      const status = await startRunner(args ?? {})
+      return JSON.stringify(status)
     } catch (err) {
       return `Runner 启动失败: ${err instanceof Error ? err.message : String(err)}`
     }
@@ -314,8 +298,8 @@ async function onMcpCommand(command, args) {
   }
   if (command === 'system.runner:reload') {
     try {
-      await runnerManager.reload()
-      return JSON.stringify(runnerManager.getStatus())
+      const status = await reloadRunner()
+      return JSON.stringify(status)
     } catch (err) {
       return `Runner 重载失败: ${err instanceof Error ? err.message : String(err)}`
     }
@@ -831,47 +815,34 @@ const runnerManager = createRunnerWindowManager({
   },
 })
 
-/** 脚本宿主实例（按需创建：runner:start 时 new，stop 时 dispose） */
-let scriptHost = null
+/**
+ * 启动 Runner（IPC 与 MCP 路径共用）。
+ * engine 已清空待重设计，当前只启 Runner 窗口（空页面），无脚本宿主。
+ */
+async function startRunner(bootstrap) {
+  // MCP 调用可能只传 projectId（无 projectRoot/name）；缺省时从 projectManager 查盘补全
+  if (!bootstrap.projectRoot && bootstrap.projectId) {
+    try {
+      const found = await projectManager.readMetaConfig(bootstrap.projectId)
+      if (found?.project) {
+        bootstrap.projectRoot = found.project.path
+        bootstrap.projectName = bootstrap.projectName ?? found.project.name
+        bootstrap.entryScene = bootstrap.entryScene ?? (found.project.entry || undefined)
+        bootstrap.entryScript = bootstrap.entryScript ?? (found.project.entryScript || undefined)
+      }
+    } catch (err) {
+      console.warn('[runner] 通过 projectId 补全 bootstrap 失败:', err.message)
+    }
+  }
+  await runnerManager.start(bootstrap)
+  return runnerManager.getStatus()
+}
 
-// 启动 Runner（IDE / MCP 调用）
+// 启动 Runner（IDE IPC 调用）
 ipcMain.handle('runner:start', async (_event, payload) => {
   try {
-    const bootstrap = payload ?? {}
-    // MCP 调用可能只传 projectId（无 projectRoot/name）；缺省时从 projectManager 查盘补全
-    if (!bootstrap.projectRoot && bootstrap.projectId) {
-      try {
-        const found = await projectManager.readMetaConfig(bootstrap.projectId)
-        if (found?.project) {
-          bootstrap.projectRoot = found.project.path
-          bootstrap.projectName = bootstrap.projectName ?? found.project.name
-          bootstrap.entryScene = bootstrap.entryScene ?? (found.project.entry || undefined)
-          bootstrap.entryScript = bootstrap.entryScript ?? (found.project.entryScript || undefined)
-        }
-      } catch (err) {
-        console.warn('[runner] 通过 projectId 补全 bootstrap 失败:', err.message)
-      }
-    }
-    // 旧 scriptHost 先停（单例语义）
-    if (scriptHost) {
-      try { scriptHost.stop() } catch {}
-      scriptHost = null
-    }
-    await runnerManager.start(bootstrap)
-    // 创建 scriptHost：主进程加载 Scene + 跑脚本 + tick + 推 dirty 给 Runner
-    // Runner ready 后（runner:ready IPC）scriptHost.handleRunnerReady 推 scene-ready + 启 tick
-    scriptHost = createScriptHost({
-      projectRoot: bootstrap.projectRoot,
-      projectId: bootstrap.projectId,
-      projectName: bootstrap.projectName ?? bootstrap.projectId,
-      entryScene: bootstrap.entryScene,
-      entryScript: bootstrap.entryScript,
-      runnerManager: {
-        sendToRunner: (event) => runnerManager.sendToRunner(event),
-      },
-    })
-    await scriptHost.start()
-    return { ok: true, status: runnerManager.getStatus() }
+    const status = await startRunner(payload ?? {})
+    return { ok: true, status }
   } catch (err) {
     console.error('[runner] start 失败:', err)
     return { error: err instanceof Error ? err.message : String(err) }
@@ -881,10 +852,6 @@ ipcMain.handle('runner:start', async (_event, payload) => {
 // 停止 Runner
 ipcMain.handle('runner:stop', async () => {
   try {
-    if (scriptHost) {
-      try { scriptHost.stop() } catch {}
-      scriptHost = null
-    }
     await runnerManager.stop()
     return { ok: true }
   } catch (err) {
@@ -892,15 +859,20 @@ ipcMain.handle('runner:stop', async () => {
   }
 })
 
+/**
+ * 重载 Runner（保留窗口，重新加载页面）。
+ * engine 已清空待重设计，当前只走 runnerManager.reload（硬 reload 页面）。
+ */
+async function reloadRunner() {
+  await runnerManager.reload()
+  return runnerManager.getStatus()
+}
+
 // 重载 Runner（保留窗口，重新加载页面）
 ipcMain.handle('runner:reload', async () => {
   try {
-    // scriptHost 先重载脚本（推 reload 给 Runner + 重推 scene-ready + 重启 tick）
-    if (scriptHost) {
-      await scriptHost.reload()
-    }
-    await runnerManager.reload()
-    return { ok: true, status: runnerManager.getStatus() }
+    const status = await reloadRunner()
+    return { ok: true, status }
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
   }
@@ -911,13 +883,9 @@ ipcMain.handle('runner:status', () => {
   return runnerManager.getStatus()
 })
 
-// Runner → 主进程：报告就绪（含 canvas 尺寸，scriptHost 据此推 scene-ready + 启 tick）
-ipcMain.handle('runner:ready', async (_event, payload) => {
+// Runner → 主进程：报告就绪
+ipcMain.handle('runner:ready', async (_event, _payload) => {
   runnerManager.markReady()
-  // 通知 scriptHost：Runner WebGPU 就绪，推 scene-ready + 启 tick
-  if (scriptHost && payload?.canvasSize) {
-    scriptHost.handleRunnerReady(payload.canvasSize)
-  }
   return { ok: true }
 })
 
