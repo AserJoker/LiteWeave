@@ -56,8 +56,10 @@ interface AttachmentDecl {
 interface MaterialDesc {
   pipelineBindings: Record<string, Record<string, string>>
   fields: Record<string, unknown>
-  /** 纹理字段解析结果：字段名 → 纹理描述（src id + 采样参数） */
-  textures: Map<string, { textureId: string; wrap: string; filter: string }>
+  /** 纹理字段解析结果：字段名 → { textureId, type }（纯纹理来源，采样参数归 sampler 字段） */
+  textures: Map<string, { textureId: string; type: string }>
+  /** sampler 字段解析结果：字段名 → { wrap, filter }（独立采样状态） */
+  samplers: Map<string, { wrap: string; filter: string }>
 }
 
 /** RO 运行时（主线程状态机） */
@@ -329,16 +331,21 @@ export class Renderer {
   private buildMaterial(id: string, data: Uint8Array): void {
     const json = JSON.parse(new TextDecoder().decode(data))
     const fields = json.fields ?? {}
-    // 解析纹理复合字段：{ src, type, wrap, filter } → 缓存字段名→纹理描述
-    // src 指向纹理资产 id（需在 loadAssets 时加载，setScene 已收集）
-    const textures = new Map<string, { textureId: string; wrap: string; filter: string }>()
+    // material 字段分两类复合字段：
+    // - texture 字段：{ src, type } → 纯纹理来源（src=资产 id），采样参数归 sampler 字段
+    // - sampler 字段：{ wrap, filter } → 独立采样状态，pipelineBindings 显式映射
+    const textures = new Map<string, { textureId: string; type: string }>()
+    const samplers = new Map<string, { wrap: string; filter: string }>()
     for (const [fname, fval] of Object.entries(fields)) {
-      if (fval && typeof fval === 'object' && typeof (fval as { src?: unknown }).src === 'string') {
-        const tv = fval as { src: string; wrap?: string; filter?: string }
-        textures.set(fname, { textureId: tv.src, wrap: tv.wrap ?? 'repeat', filter: tv.filter ?? 'linear' })
+      if (!fval || typeof fval !== 'object') continue
+      const v = fval as { src?: unknown; type?: unknown; wrap?: unknown; filter?: unknown }
+      if (typeof v.src === 'string') {
+        textures.set(fname, { textureId: v.src, type: typeof v.type === 'string' ? v.type : '2d' })
+      } else if (typeof v.wrap === 'string' || typeof v.filter === 'string') {
+        samplers.set(fname, { wrap: typeof v.wrap === 'string' ? v.wrap : 'repeat', filter: typeof v.filter === 'string' ? v.filter : 'linear' })
       }
     }
-    this.assets.materials.set(id, { pipelineBindings: json.pipelineBindings ?? {}, fields, textures })
+    this.assets.materials.set(id, { pipelineBindings: json.pipelineBindings ?? {}, fields, textures, samplers })
   }
 
   private async buildTexture(id: string, data: Uint8Array): Promise<void> {
@@ -542,11 +549,12 @@ export class Renderer {
             const tex = this.ensureAttachment(inputName)
             entries.push({ binding: decl.binding, resource: tex.createView() })
           } else if (decl.kind === 'sampler') {
-            // 按 material 纹理字段的 wrap/filter 创建 sampler；无则共享默认 sampler
+            // 从 material sampler 字段取（decl.name 经 matFieldMap 映射到 material sampler 字段名）；
+            // 无则共享默认 sampler（present-pass 等无 material sampler 的场景）
             const matFieldName = decl.name ? matFieldMap[decl.name] : undefined
-            const texDesc = matFieldName ? material?.textures.get(matFieldName) : undefined
-            if (texDesc) {
-              entries.push({ binding: decl.binding, resource: this.ensureMaterialSampler(texDesc.wrap, texDesc.filter) })
+            const sampDesc = matFieldName ? material?.samplers.get(matFieldName) : undefined
+            if (sampDesc) {
+              entries.push({ binding: decl.binding, resource: this.ensureMaterialSampler(sampDesc.wrap, sampDesc.filter) })
             } else {
               entries.push({ binding: decl.binding, resource: this.ensureSampler() })
             }
