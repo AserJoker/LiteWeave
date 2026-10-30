@@ -89,7 +89,7 @@ async function startRunner(
 
   // 4. 建 Worker，注入 bootstrap（首条 __bootstrap 消息）
   const worker = new Worker(new URL('./engineWorker.ts', import.meta.url), { type: 'module' })
-  worker.postMessage({ __bootstrap: { projectId: bootstrap.projectId, entryScene: bootstrap.entryScene } })
+  worker.postMessage({ __bootstrap: { projectId: bootstrap.projectId, entryScene: bootstrap.entryScene, entryScript: bootstrap.entryScript } })
 
   // 5. Worker → 主线程消息路由
   worker.onmessage = (ev: MessageEvent) => {
@@ -187,6 +187,26 @@ async function handleRequest(
         response = { kind: 'response', id: msg.id, ok: false, error: r.error ?? 'load-assets failed' }
         worker.postMessage(response)
       }
+    } catch (err) {
+      response = { kind: 'response', id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) }
+      worker.postMessage(response)
+    }
+    return
+  }
+
+  if (msg.type === 'readScript') {
+    const payload = msg.payload as { projectId: string; path: string }
+    try {
+      const r = await bridge.invoke<{ ok?: boolean; content?: string; error?: string }>(
+        'runner:read-script',
+        { projectId: payload.projectId, path: payload.path },
+      )
+      if (r.ok && typeof r.content === 'string') {
+        response = { kind: 'response', id: msg.id, ok: true, payload: r.content }
+      } else {
+        response = { kind: 'response', id: msg.id, ok: false, error: r.error ?? 'read-script failed' }
+      }
+      worker.postMessage(response)
     } catch (err) {
       response = { kind: 'response', id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) }
       worker.postMessage(response)

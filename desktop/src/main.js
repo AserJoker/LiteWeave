@@ -985,6 +985,23 @@ ipcMain.handle('runner:read-asset', async (_event, payload) => {
   }
 })
 
+// Runner → 主进程：按项目根相对路径读取业务脚本文本（dist/main.js 等）。
+// 区别于 read-asset（<namespace>:<path> 限 assets/<ns>/），read-script 读项目根任意相对路径，
+// 复用 projectManager.readFile（含防穿越校验）。payload: { projectId, path } → { ok, content?, error? }
+ipcMain.handle('runner:read-script', async (_event, payload) => {
+  try {
+    const projectId = payload?.projectId
+    const scriptPath = payload?.path
+    if (typeof projectId !== 'string' || typeof scriptPath !== 'string') {
+      return { error: 'invalid payload (projectId/path required)' }
+    }
+    const { content } = await projectManager.readFile(projectId, scriptPath)
+    return { ok: true, content }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+})
+
 // Runner → 主进程：批量加载资产字节（engine 文件服务后端，一次 invoke 返回所有）
 // 开发态资产量小，简单做；后续可改流式。payload: { projectId, assetIds } → { ok, results: { [id]: Uint8Array | { error } } }
 ipcMain.handle('runner:load-assets', async (_event, payload) => {

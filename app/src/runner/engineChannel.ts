@@ -19,12 +19,14 @@ import type {
   Command,
   ReadFilePayload,
   LoadAssetsPayload,
+  ReadScriptPayload,
 } from './protocol'
 
 /** 主线程响应 payload 类型映射（成功时的纯数据类型；失败走 reject） */
 interface ResponsePayloads {
   readFile: Uint8Array
   loadAssets: Record<string, Uint8Array | { error: string }>
+  readScript: string
 }
 
 type RequestType = keyof ResponsePayloads
@@ -84,7 +86,7 @@ export function waitReady(): Promise<void> {
 /** 发送 req/res 请求，等主线程 response */
 export function request<T extends RequestType>(
   type: T,
-  payload: T extends 'readFile' ? ReadFilePayload : LoadAssetsPayload,
+  payload: T extends 'readFile' ? ReadFilePayload : T extends 'readScript' ? ReadScriptPayload : LoadAssetsPayload,
 ): Promise<ResponsePayloads[T]> {
   const id = nextReqId++
   const msg: RequestMessage = { kind: 'request', id, type, payload } as RequestMessage

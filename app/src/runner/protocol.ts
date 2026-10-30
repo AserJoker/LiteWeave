@@ -19,8 +19,8 @@ export interface ReadyMessage {
 export interface RequestMessage {
   kind: 'request'
   id: number
-  type: 'readFile' | 'loadAssets'
-  payload: ReadFilePayload | LoadAssetsPayload
+  type: 'readFile' | 'loadAssets' | 'readScript'
+  payload: ReadFilePayload | LoadAssetsPayload | ReadScriptPayload
 }
 
 export interface ReadFilePayload {
@@ -31,6 +31,11 @@ export interface ReadFilePayload {
 export interface LoadAssetsPayload {
   projectId: string
   assetIds: string[]
+}
+
+export interface ReadScriptPayload {
+  projectId: string
+  path: string // 项目根相对路径（如 dist/main.js）
 }
 
 /** 主线程 → Worker：响应（配对 request id） */

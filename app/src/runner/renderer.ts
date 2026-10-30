@@ -383,11 +383,9 @@ export class Renderer {
         break
       }
       case 'setViewProjection': {
-        // Worker 推 view/projection，主线程按 canvas aspect 修正 projection[0]
-        const proj = new Float32Array(cmd.projection)
-        const aspect = this.canvas.width / this.canvas.height
-        if (proj[0] !== 0 && aspect !== 0) proj[0] = proj[0] / aspect * 1 // 占位 aspect=1 时 Worker 算的，这里按实际 aspect 修正
-        this.viewProjection = { view: new Float32Array(cmd.view), projection: proj }
+        // Worker 推 view/projection，主线程只存不改（脚本负责按 canvas aspect 算正确 projection）。
+        // 不做二次 aspect 修正：脚本已是决策层，主线程不感知 Scene/Camera，只存扁平矩阵。
+        this.viewProjection = { view: new Float32Array(cmd.view), projection: new Float32Array(cmd.projection) }
         break
       }
       case 'createDynamicBuffer':
