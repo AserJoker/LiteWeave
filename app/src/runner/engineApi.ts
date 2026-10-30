@@ -196,6 +196,32 @@ async function setScene(id: string): Promise<Scene> {
     }
   }
 
+  // material 依赖纹理：读 material JSON 解析纹理复合字段 {src} 加入加载列表
+  // （纹理是 material 的复合字段，src 指向纹理资产 id，需在 loadAssets 时一起加载）
+  const materialIds: string[] = []
+  for (const ro of scene.renderObjects) {
+    if (!ro.material.startsWith('__builtin:')) materialIds.push(ro.material)
+  }
+  if (materialIds.length > 0) {
+    const matBytes = await Promise.all(
+      materialIds.map((mid) => request('readFile', { projectId: currentProjectId, assetId: mid })),
+    )
+    for (const b of matBytes) {
+      try {
+        const mat = JSON.parse(new TextDecoder().decode(b)) as { fields?: Record<string, unknown> }
+        if (mat.fields) {
+          for (const fval of Object.values(mat.fields)) {
+            if (fval && typeof fval === 'object' && typeof (fval as { src?: unknown }).src === 'string') {
+              addAsset((fval as { src: string }).src)
+            }
+          }
+        }
+      } catch {
+        // 解析失败留给主线程 buildMaterial 报错
+      }
+    }
+  }
+
   // 批量加载（主线程拉字节 + 建 GPU 对象）
   await request('loadAssets', { projectId: currentProjectId, assetIds: [...assetIds] })
 

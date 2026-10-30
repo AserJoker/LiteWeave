@@ -42,6 +42,7 @@ interface PipelineBindingDecl {
   scope?: 'global' | 'instance' // uniform-buffer 专用
   bufferSize?: number // uniform-buffer 专用
   textureFormat?: string // sampled-texture 专用
+  name?: string // binding 名（sampled-texture/sampler 用，关联 material 字段）
 }
 
 interface AttachmentDecl {
@@ -55,6 +56,8 @@ interface AttachmentDecl {
 interface MaterialDesc {
   pipelineBindings: Record<string, Record<string, string>>
   fields: Record<string, unknown>
+  /** 纹理字段解析结果：字段名 → 纹理描述（src id + 采样参数） */
+  textures: Map<string, { textureId: string; wrap: string; filter: string }>
 }
 
 /** RO 运行时（主线程状态机） */
@@ -220,14 +223,14 @@ export class Renderer {
         continue
       }
       try {
-        this.buildAsset(id, data)
+        await this.buildAsset(id, data)
       } catch (err) {
         console.error(`[renderer] 资产构建失败 ${id}:`, err)
       }
     }
     for (const id of pipelineIds) {
       try {
-        this.buildAsset(id, results[id] as Uint8Array)
+        await this.buildAsset(id, results[id] as Uint8Array)
       } catch (err) {
         console.error(`[renderer] 资产构建失败 ${id}:`, err)
       }
@@ -235,13 +238,13 @@ export class Renderer {
   }
 
   /** 按 id 后缀分流建 GPU 对象 */
-  private buildAsset(id: string, data: Uint8Array): void {
+  private async buildAsset(id: string, data: Uint8Array): Promise<void> {
     if (id.endsWith('.graph.json')) this.buildGraph(id, data)
     else if (id.endsWith('.pipeline.json')) this.buildPipeline(id, data)
     else if (id.endsWith('.wgsl') || id.endsWith('.shader')) this.buildShader(id, data)
     else if (id.endsWith('.model.json')) this.buildModel(id, data)
     else if (id.endsWith('.mat.json')) this.buildMaterial(id, data)
-    else if (id.endsWith('.png') || id.endsWith('.jpg') || id.endsWith('.jpeg')) this.buildTexture(id, data)
+    else if (id.endsWith('.png') || id.endsWith('.jpg') || id.endsWith('.jpeg')) await this.buildTexture(id, data)
     else console.warn(`[renderer] 未知资产类型: ${id}`)
   }
 
@@ -299,13 +302,14 @@ export class Renderer {
     })
     this.assets.pipelines.set(id, pipeline)
     // 保存 binding 描述（render() 按 kind 组装 bindGroup 资源）
-    const bindings: PipelineBindingDecl[] = (desc.bindings ?? []).map((b: { binding: number; kind: string; visibility?: string; scope?: string; bufferSize?: number; textureFormat?: string }) => ({
+    const bindings: PipelineBindingDecl[] = (desc.bindings ?? []).map((b: { binding: number; kind: string; visibility?: string; scope?: string; bufferSize?: number; textureFormat?: string; name?: string }) => ({
       binding: b.binding,
       kind: b.kind as PipelineBindingDecl['kind'],
       visibility: (b.visibility ?? 'fragment') as PipelineBindingDecl['visibility'],
       scope: b.scope as 'global' | 'instance' | undefined,
       bufferSize: b.bufferSize,
       textureFormat: b.textureFormat,
+      name: b.name,
     })).sort((a: PipelineBindingDecl, b: PipelineBindingDecl) => a.binding - b.binding)
     this.assets.pipelineBindings.set(id, bindings)
   }
@@ -324,12 +328,37 @@ export class Renderer {
 
   private buildMaterial(id: string, data: Uint8Array): void {
     const json = JSON.parse(new TextDecoder().decode(data))
-    this.assets.materials.set(id, { pipelineBindings: json.pipelineBindings ?? {}, fields: json.fields ?? {} })
+    const fields = json.fields ?? {}
+    // 解析纹理复合字段：{ src, type, wrap, filter } → 缓存字段名→纹理描述
+    // src 指向纹理资产 id（需在 loadAssets 时加载，setScene 已收集）
+    const textures = new Map<string, { textureId: string; wrap: string; filter: string }>()
+    for (const [fname, fval] of Object.entries(fields)) {
+      if (fval && typeof fval === 'object' && typeof (fval as { src?: unknown }).src === 'string') {
+        const tv = fval as { src: string; wrap?: string; filter?: string }
+        textures.set(fname, { textureId: tv.src, wrap: tv.wrap ?? 'repeat', filter: tv.filter ?? 'linear' })
+      }
+    }
+    this.assets.materials.set(id, { pipelineBindings: json.pipelineBindings ?? {}, fields, textures })
   }
 
-  private buildTexture(id: string, _data: Uint8Array): void {
-    // TODO: PNG 解码 → GPUTexture（当前 demo 无纹理，占位）
-    console.warn(`[renderer] 纹理加载未实现: ${id}`)
+  private async buildTexture(id: string, data: Uint8Array): Promise<void> {
+    // PNG/JPG 解码：createImageBitmap（浏览器主线程支持，Electron 渲染进程支持）→ GPUTexture
+    // flipY=false：WebGPU 纹理坐标原点左上，PNG 顶部对应 uv.y=0，与 OpenGL 相反但 shader 里用标准 uv 采样即可
+    const blob = new Blob([data], { type: 'image/png' })
+    const bitmap = await createImageBitmap(blob)
+    const texture = this.device.createTexture({
+      size: [bitmap.width, bitmap.height, 1],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      mipLevelCount: 1,
+    })
+    this.device.queue.copyExternalImageToTexture(
+      { source: bitmap },
+      { texture },
+      [bitmap.width, bitmap.height, 1],
+    )
+    bitmap.close()
+    this.assets.textures.set(id, texture)
   }
 
   /** 消费 frame 命令 */
@@ -460,6 +489,9 @@ export class Renderer {
         if (!(pass.pipelineId in ro.pipelineBindings)) continue
         const model = this.assets.models.get(ro.modelId)
         if (!model) continue
+        const material = this.assets.materials.get(ro.materialId)
+        // pipelineBindings 二层映射：material 字段名 → pipeline binding 名
+        const fieldMap = ro.pipelineBindings[pass.pipelineId] ?? {}
 
         // 按 binding kind 组装 entries
         const entries: { binding: number; resource: GPUBufferBinding | GPUTextureView | GPUSampler }[] = []
@@ -480,12 +512,29 @@ export class Renderer {
               entries.push({ binding: decl.binding, resource: { buffer: instBuf } })
             }
           } else if (decl.kind === 'sampled-texture') {
-            // 采样 pass 的 colorInputs 对应 attachment（按 binding 顺序取）
+            // 优先从 material 纹理字段取（decl.name 经 fieldMap 映射到 material 字段名）；
+            // 无则 fallback 到 pass.colorInputs（present-pass 采样 offscreen attachment）
+            const matFieldName = decl.name ? fieldMap[decl.name] : undefined
+            const texDesc = matFieldName ? material?.textures.get(matFieldName) : undefined
+            if (texDesc) {
+              const tex = this.assets.textures.get(texDesc.textureId)
+              if (tex) {
+                entries.push({ binding: decl.binding, resource: tex.createView() })
+                continue
+              }
+            }
             const inputName = pass.colorInputs[decl.binding] ?? pass.colorInputs[0]
             const tex = this.ensureAttachment(inputName)
             entries.push({ binding: decl.binding, resource: tex.createView() })
           } else if (decl.kind === 'sampler') {
-            entries.push({ binding: decl.binding, resource: this.ensureSampler() })
+            // 按 material 纹理字段的 wrap/filter 创建 sampler；无则共享默认 sampler
+            const matFieldName = decl.name ? fieldMap[decl.name] : undefined
+            const texDesc = matFieldName ? material?.textures.get(matFieldName) : undefined
+            if (texDesc) {
+              entries.push({ binding: decl.binding, resource: this.ensureMaterialSampler(texDesc.wrap, texDesc.filter) })
+            } else {
+              entries.push({ binding: decl.binding, resource: this.ensureSampler() })
+            }
           }
         }
 
@@ -547,6 +596,24 @@ export class Renderer {
       })
     }
     return this.sampler
+  }
+
+  /** material 纹理字段的 sampler 缓存（按 wrap+filter 组合复用） */
+  private materialSamplers = new Map<string, GPUSampler>()
+  private ensureMaterialSampler(wrap: string, filter: string): GPUSampler {
+    const key = `${wrap}:${filter}`
+    let s = this.materialSamplers.get(key)
+    if (s) return s
+    const addressMode = wrap === 'repeat' ? 'repeat' : wrap === 'mirror-repeat' ? 'mirror-repeat' : 'clamp-to-edge'
+    const f = filter === 'nearest' ? 'nearest' : 'linear'
+    s = this.device.createSampler({
+      magFilter: f,
+      minFilter: f,
+      addressModeU: addressMode,
+      addressModeV: addressMode,
+    })
+    this.materialSamplers.set(key, s)
+    return s
   }
 
   getFrameCount(): number { return this.frameCount }
