@@ -3,7 +3,7 @@
  *
  * 阶段：Worker 业务大脑 + 主线程渲染状态机。
  * - 创建 WebGPU device/canvas + Renderer（渲染状态机）
- * - 创建 Worker（engineWorker.ts），注入 bootstrap（projectId/entryScene）
+ * - 创建 Worker（engineWorker.ts），注入 bootstrap（projectId/entryScript）
  * - 收 Worker ready → renderer.clear() → 回 cleared（握手协议）
  * - 收 Worker request（readFile/loadAssets）→ IPC 转发主进程 → 回 response
  * - 收 Worker frame → renderer.consumeCommands()
@@ -28,7 +28,6 @@ interface RunnerBridge {
     projectRoot: string
     projectId: string
     projectName: string
-    entryScene?: string
     entryScript?: string
   } | null
 }
@@ -89,7 +88,7 @@ async function startRunner(
 
   // 4. 建 Worker，注入 bootstrap（首条 __bootstrap 消息）
   const worker = new Worker(new URL('./engineWorker.ts', import.meta.url), { type: 'module' })
-  worker.postMessage({ __bootstrap: { projectId: bootstrap.projectId, entryScene: bootstrap.entryScene, entryScript: bootstrap.entryScript } })
+  worker.postMessage({ __bootstrap: { projectId: bootstrap.projectId, entryScript: bootstrap.entryScript } })
 
   // 5. Worker → 主线程消息路由
   worker.onmessage = (ev: MessageEvent) => {

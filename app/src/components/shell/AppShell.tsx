@@ -368,17 +368,15 @@ function clamp(v: number, min: number, max: number) {
  * IDE 持有 ProjectMeta（含 path 绝对路径 + entry 资源 id），主动传给主进程，
  * 主进程无需再 readMetaConfig 补全（MCP 调用只传 projectId 时主进程才补全）。
  */
-function buildRunnerBootstrap(project: { id: string; name: string; path: string; entry?: string } | undefined): {
+function buildRunnerBootstrap(project: { id: string; name: string; path: string } | undefined): {
   projectId?: string;
   projectName?: string;
   projectRoot?: string;
-  entryScene?: string;
 } | undefined {
   if (!project) return undefined;
   return {
     projectId: project.id,
     projectName: project.name,
     projectRoot: project.path,
-    entryScene: project.entry || undefined,
   };
 }

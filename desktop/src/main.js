@@ -265,7 +265,6 @@ const MCP_COMMANDS = [
       projectId: z.string().optional().describe('项目 id（缺省=当前打开项目）'),
       projectName: z.string().optional().describe('项目名（缺省自动补全）'),
       projectRoot: z.string().optional().describe('项目根目录绝对路径（缺省自动补全）'),
-      entryScene: z.string().optional().describe('入口场景资源 id'),
       entryScript: z.string().optional().describe('入口脚本路径'),
     },
   },
@@ -870,7 +869,6 @@ async function startRunner(bootstrap) {
       if (found?.project) {
         bootstrap.projectRoot = found.project.path
         bootstrap.projectName = bootstrap.projectName ?? found.project.name
-        bootstrap.entryScene = bootstrap.entryScene ?? (found.project.entry || undefined)
         bootstrap.entryScript = bootstrap.entryScript ?? (found.project.entryScript || undefined)
       }
     } catch (err) {

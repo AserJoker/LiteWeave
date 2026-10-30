@@ -10,7 +10,7 @@
  *   IDE ──ipc──► 主进程 runner:start/stop/reload ──► 本管理器 ──webContents──► Runner
  *   Runner ──ipc──► 主进程 runner:ready/heartbeat/console ──webContents.send──► IDE（runner:event）
  *
- * Bootstrap 注入：创建窗口时把项目信息（id/name/root + entryScene/entryScript）
+ * Bootstrap 注入：创建窗口时把项目信息（id/name/root + entryScript）
  * 序列化成 base64 JSON 放到 URL query（?bootstrap=...），Runner preload 同步解析。
  *
  * 崩溃恢复：监听 'closed' / 'render-process-gone' → 标记 stopped → 通知 IDE 显示"重启"按钮。
@@ -70,7 +70,7 @@ export function createRunnerWindowManager(opts) {
 
   /**
    * 启动 Runner。
-   * @param {{ projectId: string, projectName: string, projectRoot: string, entryScene?: string, entryScript?: string }} bootstrap
+   * @param {{ projectId: string, projectName: string, projectRoot: string, entryScript?: string }} bootstrap
    */
   async function start(bootstrap) {
     if (!bootstrap || !bootstrap.projectId || !bootstrap.projectRoot) {
@@ -260,7 +260,6 @@ export function createRunnerWindowManager(opts) {
       projectId: currentBootstrap?.projectId ?? null,
       projectName: currentBootstrap?.projectName ?? null,
       projectRoot: currentBootstrap?.projectRoot ?? null,
-      entryScene: currentBootstrap?.entryScene ?? null,
       entryScript: currentBootstrap?.entryScript ?? null,
       alive: !!runnerWin,
     }

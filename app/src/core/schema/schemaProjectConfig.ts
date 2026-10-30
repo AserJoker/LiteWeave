@@ -54,17 +54,6 @@ const schema: Schema = [
         },
       },
       {
-        id: `${PROJECT_CONFIG_SCHEMA_ID}.general.entry`,
-        kind: 'field',
-        field: {
-          key: 'entry',
-          type: 'text',
-          labelKey: 'system.projectConfig.field.entry',
-          helperKey: 'system.projectConfig.field.entryHelper',
-          placeholder: 'demo:scenes/main.scene',
-        },
-      },
-      {
         id: `${PROJECT_CONFIG_SCHEMA_ID}.general.languages`,
         kind: 'field',
         field: {

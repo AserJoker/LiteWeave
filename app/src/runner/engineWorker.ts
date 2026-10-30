@@ -12,8 +12,8 @@ import { waitReady, setNotifyHandler, request } from './engineChannel'
 import { createEngine, resetEngine } from './engineApi'
 
 // bootstrap 经 postMessage 从主线程传入
-let bootstrapResolve: ((v: { projectId: string; entryScene?: string; entryScript?: string }) => void) | null = null
-const bootstrapPromise = new Promise<{ projectId: string; entryScene?: string; entryScript?: string }>((resolve) => {
+let bootstrapResolve: ((v: { projectId: string; entryScript?: string }) => void) | null = null
+const bootstrapPromise = new Promise<{ projectId: string; entryScript?: string }>((resolve) => {
   bootstrapResolve = resolve
 })
 

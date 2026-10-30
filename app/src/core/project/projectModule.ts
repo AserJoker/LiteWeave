@@ -47,8 +47,6 @@ export interface ProjectMeta {
   namespaces: string[]
   /** 分域整体参数（rendering/input/physics/build…） */
   settings: Record<string, unknown>
-  /** 引擎启动入口（资源 id，如 demo:scenes/main.scene） */
-  entry: string
   /** 资源清单（平铺、权威、编辑器维护） */
   resources: Array<{ id: string; type: string; path: string }>
   /** 项目语言列表（.lang 资源按 id 命名 <id>.lang） */

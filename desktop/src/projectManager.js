@@ -144,9 +144,6 @@ function ensureV2Fields(meta) {
     m.defaultNamespace = m.namespaces[0]
   }
   if (!m.settings || typeof m.settings !== 'object') m.settings = defaultSettings()
-  if (typeof m.entry !== 'string' || !m.entry.includes(':')) {
-    m.entry = `${m.defaultNamespace}:scenes/main.scene`
-  }
   if (!Array.isArray(m.resources)) m.resources = []
   if (!Array.isArray(m.languages) || m.languages.length === 0) m.languages = defaultLanguages()
   return m
@@ -194,7 +191,6 @@ function zipProject(projectDir) {
  * @property {string} defaultNamespace 默认命名空间
  * @property {string[]} namespaces 全部命名空间（≥1）
  * @property {object} settings 分域整体参数
- * @property {string} entry 引擎启动入口（资源 id）
  * @property {Array} resources 资源清单
  * @property {Array<{id: string, display_name: string}>} languages 项目语言列表（.lang 资源按 id 命名）
  */
@@ -214,7 +210,6 @@ function toProject(meta, projectDir) {
     defaultNamespace: v2.defaultNamespace,
     namespaces: v2.namespaces,
     settings: v2.settings,
-    entry: v2.entry,
     entryScript: v2.entryScript,
     resources: v2.resources,
     languages: v2.languages,

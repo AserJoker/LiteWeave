@@ -32,7 +32,6 @@ export interface RunnerStatusSnapshot {
   projectId: string | null
   projectName: string | null
   projectRoot: string | null
-  entryScene: string | null
   entryScript: string | null
   alive: boolean
 }
@@ -42,7 +41,6 @@ export interface RunnerStartArgs {
   projectId?: string
   projectName?: string
   projectRoot?: string
-  entryScene?: string
   entryScript?: string
 }
 
@@ -164,7 +162,7 @@ function createRunnerService(transport: Transport, events: IEventBus): RunnerApi
     },
     async getStatus() {
       if (transport.adapter.kind !== 'electron') {
-        return { status: current, projectId: null, projectName: null, projectRoot: null, entryScene: null, entryScript: null, alive: false }
+        return { status: current, projectId: null, projectName: null, projectRoot: null, entryScript: null, alive: false }
       }
       return await transport.invoke<RunnerStatusSnapshot>('runner:status')
     },
@@ -221,7 +219,6 @@ export function registerRunner(ctx: PluginContext): void {
       projectId: { type: 'string', optional: true, description: '项目 id（缺省=当前打开项目）' },
       projectName: { type: 'string', optional: true, description: '项目名（缺省自动补全）' },
       projectRoot: { type: 'string', optional: true, description: '项目根目录绝对路径（缺省自动补全）' },
-      entryScene: { type: 'string', optional: true, description: '入口场景资源 id' },
       entryScript: { type: 'string', optional: true, description: '入口脚本路径' },
     },
   })
