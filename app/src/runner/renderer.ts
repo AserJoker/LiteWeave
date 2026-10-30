@@ -29,8 +29,17 @@ interface AssetCache {
   textures: Map<string, GPUTexture>
 }
 
+/** graph 边：attachment 从 from pass 输出 → to pass 的 toBinding 号 */
+interface GraphEdge {
+  attachment: string
+  from: string
+  to: string
+  toBinding: number
+}
+
 interface PipelineGraphRuntime {
-  passes: { name: string; pipelineId: string; colorOutputs: string[]; depthOutput?: string; colorInputs: string[] }[]
+  passes: { name: string; pipelineId: string; colorOutputs: string[]; depthOutput?: string }[]
+  edges: GraphEdge[]
   attachmentDecls: Map<string, AttachmentDecl>
 }
 
@@ -254,17 +263,21 @@ export class Renderer {
   }
 
   private buildGraph(id: string, data: Uint8Array): void {
-    const json = JSON.parse(new TextDecoder().decode(data))
+    const json = JSON.parse(new TextDecoder().decode(data)) as {
+      nodes: { name: string; pipeline: string; colorAttachmentOutputs?: string[]; depthAttachment?: string }[]
+      edges?: { attachment: string; from: string; to: string; toBinding: number }[]
+      attachments?: { name: string; kind: string; format: string; size?: { mode?: string }; sampledByLaterPass?: boolean }[]
+    }
     const graph: PipelineGraphRuntime = {
-      passes: json.nodes.map((n: { name: string; pipeline: string; colorAttachmentOutputs: string[]; depthAttachment?: string; colorAttachmentInputs: string[] }) => ({
+      passes: json.nodes.map((n) => ({
         name: n.name,
         pipelineId: n.pipeline,
         colorOutputs: n.colorAttachmentOutputs ?? [],
         depthOutput: n.depthAttachment,
-        colorInputs: n.colorAttachmentInputs ?? [],
       })),
+      edges: (json.edges ?? []).map((e) => ({ attachment: e.attachment, from: e.from, to: e.to, toBinding: e.toBinding })),
       attachmentDecls: new Map(
-        (json.attachments ?? []).map((a: { name: string; kind: string; format: string; size?: { mode?: string }; sampledByLaterPass?: boolean }) => [
+        (json.attachments ?? []).map((a) => [
           a.name,
           { name: a.name, kind: a.kind, format: a.format, sizeMode: a.size?.mode ?? 'swapchain', sampledByLaterPass: a.sampledByLaterPass ?? false },
         ]),
@@ -484,29 +497,31 @@ export class Renderer {
     for (const pass of graph.passes) {
       const pipeline = this.assets.pipelines.get(pass.pipelineId)
       if (!pipeline) continue
-
-      // 解析 pass 输出 attachment：swapchain 直出，否则 lazy 建离屏纹理
-      let colorView: GPUTextureView
-      let isSwapchain = false
       if (pass.colorOutputs.length === 0) continue
-      const outName = pass.colorOutputs[0]
-      if (outName === 'swapchain') {
-        colorView = context.getCurrentTexture().createView()
-        isSwapchain = true
-      } else {
-        colorView = this.ensureAttachment(outName).createView()
-      }
+
+      // MRT：遍历所有 colorOutputs 组装 colorAttachments 数组。
+      // swapchain 输出用 context.getCurrentTexture()，其余 lazy 建离屏纹理（ensureAttachment）。
+      const colorAttachments: GPURenderPassColorAttachment[] = pass.colorOutputs.map((outName) => {
+        const view = outName === 'swapchain'
+          ? context.getCurrentTexture().createView()
+          : this.ensureAttachment(outName).createView()
+        return { view, clearValue: { r: 0.1, g: 0.1, b: 0.12, a: 1 }, loadOp: 'clear', storeOp: 'store' }
+      })
 
       // depth 只给声明了 depthOutput 的 pass 挂；swapchain pass（如 present blit）无 depth
-      // 之前 swapchain pass 无条件挂 this.depthTexture，但 present pipeline 无 depthState，
-      // resize 重建 depthTexture 后 renderPass 带 depth 与 pipeline 不匹配 → validation error 全黑
       const depthView = pass.depthOutput ? this.ensureAttachment(pass.depthOutput).createView() : undefined
 
       const renderPass = commandEncoder.beginRenderPass({
-        colorAttachments: [{ view: colorView, clearValue: { r: 0.1, g: 0.1, b: 0.12, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+        colorAttachments,
         depthStencilAttachment: depthView ? { view: depthView, depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' } : undefined,
       })
       renderPass.setPipeline(pipeline)
+
+      // 入边映射：attachment → toBinding（供 sampled-texture fallback 查输入纹理）
+      const inputBindings = new Map<number, string>()
+      for (const e of graph.edges) {
+        if (e.to === pass.name) inputBindings.set(e.toBinding, e.attachment)
+      }
 
       // 按 pipeline binding 描述组装 bindGroup 资源（区分 uniform/texture/sampler）
       const bindingDecls = this.assets.pipelineBindings.get(pass.pipelineId) ?? []
@@ -547,7 +562,7 @@ export class Renderer {
               entries.push({ binding: decl.binding, resource: { buffer: instBuf } })
             }
           } else if (decl.kind === 'sampled-texture') {
-            // 按 matMaps.textures 映射查 material.textures 表；无则 fallback 到 pass.colorInputs（present-pass）
+            // 按 matMaps.textures 映射查 material.textures 表；无则 fallback 到入边映射（graph edges toBinding → attachment）
             const matKey = matMaps.textures[decl.name]
             const texDesc = matKey ? material?.textures.get(matKey) : undefined
             if (texDesc) {
@@ -557,9 +572,12 @@ export class Renderer {
                 continue
               }
             }
-            const inputName = pass.colorInputs[decl.binding] ?? pass.colorInputs[0]
-            const tex = this.ensureAttachment(inputName)
-            entries.push({ binding: decl.binding, resource: tex.createView() })
+            const inputName = inputBindings.get(decl.binding)
+            if (inputName) {
+              const tex = this.ensureAttachment(inputName)
+              entries.push({ binding: decl.binding, resource: tex.createView() })
+            }
+            // 无 material 纹理也无入边：跳过（binding 缺失会被 WebGPU 校验拦截，便于发现配置错误）
           } else if (decl.kind === 'sampler') {
             // 按 matMaps.samplers 映射查 material.samplers 表；无则共享默认 sampler
             const matKey = matMaps.samplers[decl.name]
