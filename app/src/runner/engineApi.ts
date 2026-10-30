@@ -9,7 +9,7 @@
  * 详见 docs/design/engine-redesign.md §6。
  */
 import { request, sendFrame, onEvent } from './engineChannel'
-import type { Command } from './protocol'
+import type { Command, PipelineBindings } from './protocol'
 
 /** 只读 Scene 数据（setScene 返回） */
 export interface Scene {
@@ -32,7 +32,7 @@ export interface SceneRenderObject {
   name?: string
   model: string
   material: string
-  pipelineBindings: Record<string, Record<string, string>>
+  pipelineBindings: PipelineBindings
 }
 
 /** 命令缓冲区（render.* push，commit 发送） */
@@ -88,7 +88,7 @@ const render = {
     name: string
     model: string
     material: string
-    pipelineBindings: Record<string, Record<string, string>>
+    pipelineBindings: PipelineBindings
     initialFields?: Record<string, Float32Array>
   }): ROShadow {
     if (roShadows.has(opts.name)) throw new Error(`RenderObject name 冲突: ${opts.name}`)
@@ -196,8 +196,8 @@ async function setScene(id: string): Promise<Scene> {
     }
   }
 
-  // material 依赖纹理：读 material JSON 解析纹理复合字段 {src} 加入加载列表
-  // （纹理是 material 的复合字段，src 指向纹理资产 id，需在 loadAssets 时一起加载）
+  // material 依赖纹理：读 material JSON 的 textures 表，收集 src 加入加载列表
+  // （textures 表的 src 指向纹理资产 id，需在 loadAssets 时一起加载）
   const materialIds: string[] = []
   for (const ro of scene.renderObjects) {
     if (!ro.material.startsWith('__builtin:')) materialIds.push(ro.material)
@@ -208,12 +208,10 @@ async function setScene(id: string): Promise<Scene> {
     )
     for (const b of matBytes) {
       try {
-        const mat = JSON.parse(new TextDecoder().decode(b)) as { fields?: Record<string, unknown> }
-        if (mat.fields) {
-          for (const fval of Object.values(mat.fields)) {
-            if (fval && typeof fval === 'object' && typeof (fval as { src?: unknown }).src === 'string') {
-              addAsset((fval as { src: string }).src)
-            }
+        const mat = JSON.parse(new TextDecoder().decode(b)) as { textures?: Record<string, { src?: string }> }
+        if (mat.textures) {
+          for (const tv of Object.values(mat.textures)) {
+            if (tv && typeof tv.src === 'string') addAsset(tv.src)
           }
         }
       } catch {

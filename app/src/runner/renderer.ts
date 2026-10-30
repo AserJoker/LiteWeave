@@ -7,7 +7,7 @@
  * 详见 docs/design/engine-redesign.md §7。
  */
 import { mat4 } from 'gl-matrix'
-import type { Command } from './protocol'
+import type { Command, BindingMappings, PipelineBindings } from './protocol'
 
 /** 内置资源 id 前缀（不随 scene 销毁，reload 重建） */
 export const BUILTIN_PREFIX = '__builtin:'
@@ -42,8 +42,10 @@ interface PipelineBindingDecl {
   scope?: 'global' | 'instance' // uniform-buffer 专用
   bufferSize?: number // uniform-buffer 专用
   textureFormat?: string // sampled-texture 专用
-  name?: string // binding 名（sampled-texture/sampler 用，关联 material 字段）
+  name: string // binding 语义名（来自 pipeline 声明），用于查 BindingMappings 对应组
 }
+
+
 
 interface AttachmentDecl {
   name: string
@@ -54,11 +56,12 @@ interface AttachmentDecl {
 }
 
 interface MaterialDesc {
-  pipelineBindings: Record<string, Record<string, string>>
+  pipelineBindings: PipelineBindings
+  /** uniform 实例数据（脚本 setField 覆盖，如 modelMatrix）；静态字段 initialFields 一次写入 */
   fields: Record<string, unknown>
-  /** 纹理字段解析结果：字段名 → { textureId, type }（纯纹理来源，采样参数归 sampler 字段） */
+  /** 纹理表：字段名 → { textureId, type }（纯纹理来源） */
   textures: Map<string, { textureId: string; type: string }>
-  /** sampler 字段解析结果：字段名 → { wrap, filter }（独立采样状态） */
+  /** sampler 表：字段名 → { wrap, filter }（独立采样状态） */
   samplers: Map<string, { wrap: string; filter: string }>
 }
 
@@ -67,7 +70,7 @@ interface RORuntime {
   name: string
   modelId: string
   materialId: string
-  pipelineBindings: Record<string, Record<string, string>>
+  pipelineBindings: PipelineBindings
   fields: Map<string, Float32Array>
   locked: boolean
   uniformBuffers: Map<string, GPUBuffer> // pipelineId → instance uniform buffer
@@ -311,7 +314,7 @@ export class Renderer {
       scope: b.scope as 'global' | 'instance' | undefined,
       bufferSize: b.bufferSize,
       textureFormat: b.textureFormat,
-      name: b.name,
+      name: b.name ?? '',
     })).sort((a: PipelineBindingDecl, b: PipelineBindingDecl) => a.binding - b.binding)
     this.assets.pipelineBindings.set(id, bindings)
   }
@@ -329,23 +332,28 @@ export class Renderer {
   }
 
   private buildMaterial(id: string, data: Uint8Array): void {
-    const json = JSON.parse(new TextDecoder().decode(data))
-    const fields = json.fields ?? {}
-    // material 字段分两类复合字段：
-    // - texture 字段：{ src, type } → 纯纹理来源（src=资产 id），采样参数归 sampler 字段
-    // - sampler 字段：{ wrap, filter } → 独立采样状态，pipelineBindings 显式映射
-    const textures = new Map<string, { textureId: string; type: string }>()
-    const samplers = new Map<string, { wrap: string; filter: string }>()
-    for (const [fname, fval] of Object.entries(fields)) {
-      if (!fval || typeof fval !== 'object') continue
-      const v = fval as { src?: unknown; type?: unknown; wrap?: unknown; filter?: unknown }
-      if (typeof v.src === 'string') {
-        textures.set(fname, { textureId: v.src, type: typeof v.type === 'string' ? v.type : '2d' })
-      } else if (typeof v.wrap === 'string' || typeof v.filter === 'string') {
-        samplers.set(fname, { wrap: typeof v.wrap === 'string' ? v.wrap : 'repeat', filter: typeof v.filter === 'string' ? v.filter : 'linear' })
-      }
+    const json = JSON.parse(new TextDecoder().decode(data)) as {
+      fields?: Record<string, unknown>
+      textures?: Record<string, { src: string; type?: string }>
+      samplers?: Record<string, { wrap?: string; filter?: string }>
+      pipelineBindings?: PipelineBindings
     }
-    this.assets.materials.set(id, { pipelineBindings: json.pipelineBindings ?? {}, fields, textures, samplers })
+    // 顶层三表并列：fields(uniform 实例数据) / textures(纹理来源) / samplers(采样状态)
+    // buildMaterial 直接解析三表，不按字段内容特判；pipelineBindings 三组映射引用各表 key
+    const textures = new Map<string, { textureId: string; type: string }>()
+    for (const [k, v] of Object.entries(json.textures ?? {})) {
+      textures.set(k, { textureId: v.src, type: v.type ?? '2d' })
+    }
+    const samplers = new Map<string, { wrap: string; filter: string }>()
+    for (const [k, v] of Object.entries(json.samplers ?? {})) {
+      samplers.set(k, { wrap: v.wrap ?? 'repeat', filter: v.filter ?? 'linear' })
+    }
+    this.assets.materials.set(id, {
+      pipelineBindings: json.pipelineBindings ?? {},
+      fields: json.fields ?? {},
+      textures,
+      samplers,
+    })
   }
 
   private async buildTexture(id: string, data: Uint8Array): Promise<void> {
@@ -509,11 +517,15 @@ export class Renderer {
         const model = this.assets.models.get(ro.modelId)
         if (!model) continue
         const material = this.assets.materials.get(ro.materialId)
-        // 二层映射分两套：
-        // - uniform 字段映射用 RO.pipelineBindings（脚本 setField 写的 instance 字段，如 modelMatrix）
-        // - 纹理/sampler 字段映射用 material.pipelineBindings（material 复合字段，如 baseTexture/baseSampler）
-        const uniformFieldMap = ro.pipelineBindings[pass.pipelineId] ?? {}
-        const matFieldMap = material?.pipelineBindings[pass.pipelineId] ?? {}
+        // 三组映射按 binding kind 分离：
+        // - uniforms:  RO.pipelineBindings 提供（uniform 实例字段由 RO 持有，脚本 setField 写）
+        // - textures/samplers: material.pipelineBindings 提供（材质资产数据）
+        // 每组 Record<bindingName, materialKey>，decl.name 查对应组拿到目标表 key
+        // 归一化三组映射（旧扁平结构或缺失子表都兜底成空 Record，避免 undefined 访问）
+        const rawRo = ro.pipelineBindings[pass.pipelineId] as Partial<BindingMappings> | undefined
+        const rawMat = material?.pipelineBindings[pass.pipelineId] as Partial<BindingMappings> | undefined
+        const roMaps: BindingMappings = { uniforms: rawRo?.uniforms ?? {}, textures: rawRo?.textures ?? {}, samplers: rawRo?.samplers ?? {} }
+        const matMaps: BindingMappings = { uniforms: rawMat?.uniforms ?? {}, textures: rawMat?.textures ?? {}, samplers: rawMat?.samplers ?? {} }
 
         // 按 binding kind 组装 entries
         const entries: { binding: number; resource: GPUBufferBinding | GPUTextureView | GPUSampler }[] = []
@@ -527,17 +539,17 @@ export class Renderer {
               device.queue.writeBuffer(globalBuf, 0, new Float32Array(vp))
               entries.push({ binding: decl.binding, resource: { buffer: globalBuf } })
             } else {
-              // instance uniform（modelMatrix，默认 identity；脚本可 setField 覆盖）
+              // instance uniform：按 roMaps.uniforms 映射查字段名，从 ro.fields 取值；缺省 identity
+              const fieldName = roMaps.uniforms[decl.name] ?? decl.name
               const instBuf = this.ensureInstanceUniform(ro, pass.pipelineId)
-              const mm = ro.fields.get('modelMatrix') ?? new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
+              const mm = ro.fields.get(fieldName) ?? new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
               device.queue.writeBuffer(instBuf, 0, mm)
               entries.push({ binding: decl.binding, resource: { buffer: instBuf } })
             }
           } else if (decl.kind === 'sampled-texture') {
-            // 优先从 material 纹理字段取（decl.name 经 matFieldMap 映射到 material 字段名）；
-            // 无则 fallback 到 pass.colorInputs（present-pass 采样 offscreen attachment）
-            const matFieldName = decl.name ? matFieldMap[decl.name] : undefined
-            const texDesc = matFieldName ? material?.textures.get(matFieldName) : undefined
+            // 按 matMaps.textures 映射查 material.textures 表；无则 fallback 到 pass.colorInputs（present-pass）
+            const matKey = matMaps.textures[decl.name]
+            const texDesc = matKey ? material?.textures.get(matKey) : undefined
             if (texDesc) {
               const tex = this.assets.textures.get(texDesc.textureId)
               if (tex) {
@@ -549,10 +561,9 @@ export class Renderer {
             const tex = this.ensureAttachment(inputName)
             entries.push({ binding: decl.binding, resource: tex.createView() })
           } else if (decl.kind === 'sampler') {
-            // 从 material sampler 字段取（decl.name 经 matFieldMap 映射到 material sampler 字段名）；
-            // 无则共享默认 sampler（present-pass 等无 material sampler 的场景）
-            const matFieldName = decl.name ? matFieldMap[decl.name] : undefined
-            const sampDesc = matFieldName ? material?.samplers.get(matFieldName) : undefined
+            // 按 matMaps.samplers 映射查 material.samplers 表；无则共享默认 sampler
+            const matKey = matMaps.samplers[decl.name]
+            const sampDesc = matKey ? material?.samplers.get(matKey) : undefined
             if (sampDesc) {
               entries.push({ binding: decl.binding, resource: this.ensureMaterialSampler(sampDesc.wrap, sampDesc.filter) })
             } else {

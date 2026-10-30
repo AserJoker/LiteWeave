@@ -10,6 +10,21 @@
  * 详见 docs/design/engine-redesign.md §4 通讯协议。
  */
 
+/**
+ * pipelineBindings 三组映射：按 binding kind 分组，每组 Record<bindingName, materialKey>。
+ * - uniforms:  uniform-buffer binding 名 → RO uniform 字段名（如 modelMatrix）
+ * - textures:  sampled-texture binding 名 → material.textures 表 key
+ * - samplers:  sampler binding 名 → material.samplers 表 key
+ * binding 名来自 pipeline 声明的 binding 语义名（shader 内 @binding 的用途名）。
+ */
+export interface BindingMappings {
+  uniforms: Record<string, string>
+  textures: Record<string, string>
+  samplers: Record<string, string>
+}
+/** pipelineId → 三组映射（material 和 RO 各持一份） */
+export type PipelineBindings = Record<string, BindingMappings>
+
 /** Worker → 主线程：握手启动信号（特殊，无 id） */
 export interface ReadyMessage {
   kind: 'ready'
@@ -71,7 +86,7 @@ export type MainToWorker = ResponseMessage | NotifyMessage
 
 /** 命令（frame 内，commit 校验后发） */
 export type Command =
-  | { op: 'addRO'; name: string; modelId: string; materialId: string; pipelineBindings: Record<string, Record<string, string>>; initialFields?: Record<string, Float32Array> }
+  | { op: 'addRO'; name: string; modelId: string; materialId: string; pipelineBindings: PipelineBindings; initialFields?: Record<string, Float32Array> }
   | { op: 'removeRO'; name: string }
   | { op: 'setField'; name: string; field: string; value: Float32Array }
   | { op: 'lockRO'; name: string }
