@@ -342,22 +342,34 @@ export class Renderer {
   }
 
   private async buildTexture(id: string, data: Uint8Array): Promise<void> {
-    // PNG/JPG 解码：createImageBitmap（浏览器主线程支持，Electron 渲染进程支持）→ GPUTexture
-    // flipY=false：WebGPU 纹理坐标原点左上，PNG 顶部对应 uv.y=0，与 OpenGL 相反但 shader 里用标准 uv 采样即可
+    // PNG 解码：createImageBitmap → OffscreenCanvas getImageData 取 RGBA → writeTexture
+    // 不用 copyExternalImageToTexture（Chromium/Electron 下从 blob ImageBitmap copy 静默失败，
+    // 推测是 ImageBitmap 内部 GPU 路径与 queue copy 不兼容），改走 2D canvas 读像素 + writeTexture
     const blob = new Blob([data], { type: 'image/png' })
-    const bitmap = await createImageBitmap(blob)
+    const bitmap = await createImageBitmap(blob, { imageOrientation: 'none', premultiplyAlpha: 'none', colorSpaceConversion: 'none' })
+    const w = bitmap.width
+    const h = bitmap.height
+    // OffscreenCanvas 把 bitmap 转成可读 ImageData（RGBA）
+    const canvas = new OffscreenCanvas(w, h)
+    const ctx = canvas.getContext('2d')!
+    ctx.drawImage(bitmap, 0, 0)
+    const imgData = ctx.getImageData(0, 0, w, h)
+    bitmap.close()
+    // COPY_SRC 用于调试读回验证；TEXTURE_BINDING 供 shader 采样；COPY_DST 接收 writeTexture
     const texture = this.device.createTexture({
-      size: [bitmap.width, bitmap.height, 1],
+      size: [w, h, 1],
       format: 'rgba8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
       mipLevelCount: 1,
     })
-    this.device.queue.copyExternalImageToTexture(
-      { source: bitmap },
+    // imgData.data 是 Uint8ClampedArray，包成 Uint8Array view 给 writeTexture
+    const rgba = new Uint8Array(imgData.data.buffer, imgData.data.byteOffset, imgData.data.byteLength)
+    this.device.queue.writeTexture(
       { texture },
-      [bitmap.width, bitmap.height, 1],
+      rgba,
+      { bytesPerRow: w * 4, rowsPerHeight: h },
+      [w, h, 1],
     )
-    bitmap.close()
     this.assets.textures.set(id, texture)
   }
 
@@ -490,8 +502,11 @@ export class Renderer {
         const model = this.assets.models.get(ro.modelId)
         if (!model) continue
         const material = this.assets.materials.get(ro.materialId)
-        // pipelineBindings 二层映射：material 字段名 → pipeline binding 名
-        const fieldMap = ro.pipelineBindings[pass.pipelineId] ?? {}
+        // 二层映射分两套：
+        // - uniform 字段映射用 RO.pipelineBindings（脚本 setField 写的 instance 字段，如 modelMatrix）
+        // - 纹理/sampler 字段映射用 material.pipelineBindings（material 复合字段，如 baseTexture/baseSampler）
+        const uniformFieldMap = ro.pipelineBindings[pass.pipelineId] ?? {}
+        const matFieldMap = material?.pipelineBindings[pass.pipelineId] ?? {}
 
         // 按 binding kind 组装 entries
         const entries: { binding: number; resource: GPUBufferBinding | GPUTextureView | GPUSampler }[] = []
@@ -512,9 +527,9 @@ export class Renderer {
               entries.push({ binding: decl.binding, resource: { buffer: instBuf } })
             }
           } else if (decl.kind === 'sampled-texture') {
-            // 优先从 material 纹理字段取（decl.name 经 fieldMap 映射到 material 字段名）；
+            // 优先从 material 纹理字段取（decl.name 经 matFieldMap 映射到 material 字段名）；
             // 无则 fallback 到 pass.colorInputs（present-pass 采样 offscreen attachment）
-            const matFieldName = decl.name ? fieldMap[decl.name] : undefined
+            const matFieldName = decl.name ? matFieldMap[decl.name] : undefined
             const texDesc = matFieldName ? material?.textures.get(matFieldName) : undefined
             if (texDesc) {
               const tex = this.assets.textures.get(texDesc.textureId)
@@ -528,7 +543,7 @@ export class Renderer {
             entries.push({ binding: decl.binding, resource: tex.createView() })
           } else if (decl.kind === 'sampler') {
             // 按 material 纹理字段的 wrap/filter 创建 sampler；无则共享默认 sampler
-            const matFieldName = decl.name ? fieldMap[decl.name] : undefined
+            const matFieldName = decl.name ? matFieldMap[decl.name] : undefined
             const texDesc = matFieldName ? material?.textures.get(matFieldName) : undefined
             if (texDesc) {
               entries.push({ binding: decl.binding, resource: this.ensureMaterialSampler(texDesc.wrap, texDesc.filter) })
@@ -562,7 +577,7 @@ export class Renderer {
     tex = this.device.createTexture({
       size: [this.canvas.width, this.canvas.height],
       format,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     })
     this.attachments.set(name, tex)
     return tex
