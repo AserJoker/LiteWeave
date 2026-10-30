@@ -90,11 +90,26 @@ async function startRunner(
   const worker = new Worker(new URL('./engineWorker.ts', import.meta.url), { type: 'module' })
   worker.postMessage({ __bootstrap: { projectId: bootstrap.projectId, entryScript: bootstrap.entryScript } })
 
+  // 推 resize 事件给 Worker（脚本据此重算 projection aspect）
+  const pushResize = () => {
+    const w = canvas.width
+    const h = canvas.height
+    if (w <= 0 || h <= 0) return
+    const notify: NotifyMessage = {
+      kind: 'notify',
+      type: 'event',
+      payload: { event: 'resize', data: { width: w, height: h, aspect: w / h } },
+    }
+    worker.postMessage(notify)
+  }
+  // canvas 尺寸变化时推（ResizeObserver 链路）
+  renderer.onResize = pushResize
+
   // 5. Worker → 主线程消息路由
   worker.onmessage = (ev: MessageEvent) => {
     const msg = ev.data
     if (!msg || typeof msg !== 'object') return
-    handleWorkerMessage(msg, worker, renderer, bridge)
+    handleWorkerMessage(msg, worker, renderer, bridge, pushResize)
   }
   worker.onerror = (e) => {
     console.error('[runner] Worker 错误:', e.message, e.filename, e.lineno)
@@ -107,13 +122,16 @@ function handleWorkerMessage(
   worker: Worker,
   renderer: Renderer,
   bridge: RunnerBridge,
+  pushResize: () => void,
 ): void {
   if (msg.kind === 'ready') {
-    // 握手：Worker ready → 主线程清空状态 → 回 cleared
+    // 握手：Worker ready → 主线程清空状态 → 回 cleared → 推首次 resize（脚本拿真实 canvas 尺寸）
     console.log('[runner] 收到 Worker ready，清空状态')
     renderer.clear()
     const cleared: NotifyMessage = { kind: 'notify', type: 'cleared' }
     worker.postMessage(cleared)
+    // cleared 后同步推首次 resize（早于脚本 engine.on 注册时，engineChannel 缓存回放）
+    pushResize()
     return
   }
 

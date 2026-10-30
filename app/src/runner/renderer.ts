@@ -88,6 +88,9 @@ export class Renderer {
     textures: new Map(),
   }
 
+  /** canvas 尺寸变化回调（main.ts 注册后推 resize 事件给 Worker） */
+  onResize: ((width: number, height: number) => void) | null = null
+
   private ros = new Map<string, RORuntime>()
   private viewProjection: { view: Float32Array; projection: Float32Array } | null = null
   private globalUniforms = new Map<string, GPUBuffer>() // pipelineId → global uniform buffer
@@ -408,6 +411,8 @@ export class Renderer {
       // attachment 全删，下帧 lazy 重建
       for (const t of this.attachments.values()) t.destroy()
       this.attachments.clear()
+      // 通知外部（main.ts 推 resize 事件给 Worker，脚本据此重算 projection）
+      this.onResize?.(w, h)
     }
   }
 

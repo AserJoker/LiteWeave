@@ -56,8 +56,14 @@ export interface FrameMessage {
 /** 主线程 → Worker：单向通知 */
 export interface NotifyMessage {
   kind: 'notify'
-  type: 'cleared' | 'warn' | 'error'
+  type: 'cleared' | 'warn' | 'error' | 'event'
   payload?: unknown
+}
+
+/** event 通知的 payload 结构（type='event' 时） */
+export interface EventPayload {
+  event: string
+  data?: unknown
 }
 
 export type WorkerToMain = ReadyMessage | RequestMessage | FrameMessage

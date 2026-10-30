@@ -8,7 +8,7 @@
  *
  * 详见 docs/design/engine-redesign.md §6。
  */
-import { request, sendFrame } from './engineChannel'
+import { request, sendFrame, onEvent } from './engineChannel'
 import type { Command } from './protocol'
 
 /** 只读 Scene 数据（setScene 返回） */
@@ -230,12 +230,14 @@ export interface Engine {
   setScene(id: string): Promise<Scene>
   render: typeof render
   assets: typeof assets
+  /** 订阅主线程事件（resize/keydown/...）。返回 unsubscribe。早期事件缓存命中时立即回放一次。 */
+  on(event: string, cb: (data: unknown) => void): () => void
 }
 
 /** 创建 engine 实例（注入 projectId） */
 export function createEngine(projectId: string): Engine {
   currentProjectId = projectId
-  return { setScene, render, assets }
+  return { setScene, render, assets, on: onEvent }
 }
 
 /** 重置 engine 状态（reload 时调用，清命令缓冲区 + RO 影子 + lock） */

@@ -15,6 +15,7 @@ import type {
   RequestMessage,
   ResponseMessage,
   NotifyMessage,
+  EventPayload,
   FrameMessage,
   Command,
   ReadFilePayload,
@@ -43,9 +44,35 @@ let clearedResolve: (() => void) | null = null
 /** 通知回调（外部注册，处理 cleared/warn/error） */
 let notifyHandler: ((msg: NotifyMessage) => void) | null = null
 
+/** 事件总线：event 名 → listener 集合（engine.on 注册） */
+const eventListeners = new Map<string, Set<(data: unknown) => void>>()
+/** 早期事件缓存：event 名 → 最近一次 data（事件早于 engine.on 注册时缓存，注册时回放） */
+const earlyEventCache = new Map<string, unknown>()
+
 /** 注册主线程通知回调 */
 export function setNotifyHandler(handler: ((msg: NotifyMessage) => void) | null): void {
   notifyHandler = handler
+}
+
+/** 订阅主线程事件（engine.on 内部调用）。返回 unsubscribe。早期缓存命中时立即回放一次。 */
+export function onEvent(event: string, cb: (data: unknown) => void): () => void {
+  let set = eventListeners.get(event)
+  if (!set) {
+    set = new Set()
+    eventListeners.set(event, set)
+  }
+  set.add(cb)
+  // 早期事件回放：事件在 on 注册前到达，缓存最近一次 data 立即投递
+  if (earlyEventCache.has(event)) {
+    cb(earlyEventCache.get(event))
+  }
+  return () => {
+    const s = eventListeners.get(event)
+    if (s) {
+      s.delete(cb)
+      if (s.size === 0) eventListeners.delete(event)
+    }
+  }
 }
 
 /** 监听主线程消息（Worker 入口调用一次） */
@@ -67,6 +94,16 @@ self.onmessage = (ev: MessageEvent) => {
       const r = clearedResolve
       clearedResolve = null
       r()
+      return
+    }
+    if (msg.type === 'event') {
+      // 主线程事件 → 分发给已注册 listener；无 listener 时缓存最近值（engine.on 注册时回放）
+      const p = msg.payload as EventPayload
+      if (p && typeof p.event === 'string') {
+        earlyEventCache.set(p.event, p.data)
+        const set = eventListeners.get(p.event)
+        if (set) for (const cb of set) cb(p.data)
+      }
       return
     }
     if (notifyHandler) notifyHandler(msg)
