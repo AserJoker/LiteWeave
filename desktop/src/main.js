@@ -396,6 +396,21 @@ function applyPendingMcpCommands() {
 const consoleRing = []
 const CONSOLE_RING_MAX = 200
 
+/** 把日志条目 push 进环形缓冲（统一入口） */
+function pushConsoleRing(entry) {
+  consoleRing.push(entry)
+  if (consoleRing.length > CONSOLE_RING_MAX) consoleRing.splice(0, consoleRing.length - CONSOLE_RING_MAX)
+}
+
+// 拦截主进程 console.log/warn/error，注入 consoleRing（source: 'main'）
+// 这样 MCP debug_console 能查到 Electron 主进程日志（IPC handler/服务层/文件服务等）
+const _origLog = console.log.bind(console)
+const _origWarn = console.warn.bind(console)
+const _origError = console.error.bind(console)
+console.log = (...args) => { pushConsoleRing({ level: 'info', message: args.map(String).join(' '), source: 'main' }); _origLog(...args) }
+console.warn = (...args) => { pushConsoleRing({ level: 'warning', message: args.map(String).join(' '), source: 'main' }); _origWarn(...args) }
+console.error = (...args) => { pushConsoleRing({ level: 'error', message: args.map(String).join(' '), source: 'main' }); _origError(...args) }
+
 /** 收集各窗口渲染进程的 console 日志到环形缓冲（兼容新旧事件签名） */
 function watchRendererConsole(win) {
   win.webContents.on('console-message', (_event, levelOrDetails, message, line, sourceId) => {
@@ -418,8 +433,7 @@ function watchRendererConsole(win) {
         source: sourceId,
       }
     }
-    consoleRing.push(entry)
-    if (consoleRing.length > CONSOLE_RING_MAX) consoleRing.splice(0, consoleRing.length - CONSOLE_RING_MAX)
+    pushConsoleRing(entry)
   })
 }
 
@@ -811,6 +825,9 @@ const runnerManager = createRunnerWindowManager({
     pushRunnerEventToIDE({ type: 'status', status, info: info ?? null, at: new Date().toISOString() })
   },
   onConsole: (entry) => {
+    // Runner（含 Worker）console 同步进 consoleRing，供 MCP debug_console 查询
+    consoleRing.push({ ...entry, source: `runner:${entry.source ?? ''}` })
+    if (consoleRing.length > CONSOLE_RING_MAX) consoleRing.splice(0, consoleRing.length - CONSOLE_RING_MAX)
     pushRunnerEventToIDE({ type: 'console', entry })
   },
 })
@@ -925,24 +942,42 @@ ipcMain.handle('runner:send-event', async (_event, payload) => {
   return { ok: true }
 })
 
-// Runner → 主进程：读取项目内资产文件文本（AssetLoader 的 fs 适配器后端）
-// Runner 渲染进程无 Node fs 权限（contextIsolation），统一经主进程读项目目录文件。
-// payload: { projectRoot, relativePath } → { content } 或 { error }
+// Runner → 主进程：按资产 id 读取单个资产字节（engine 文件服务后端）
+// id 格式 <namespace>:<path>，主进程解析为 assets/<ns>/<path> 读磁盘。
+// 主进程是纯文件服务器，不理解资产语义。payload: { projectId, assetId } → { ok, data?: Uint8Array, error? }
 ipcMain.handle('runner:read-asset', async (_event, payload) => {
   try {
-    const projectRoot = payload?.projectRoot
-    const relativePath = payload?.relativePath
-    if (typeof projectRoot !== 'string' || typeof relativePath !== 'string') {
-      return { error: 'invalid payload (projectRoot/relativePath required)' }
+    const projectId = payload?.projectId
+    const assetId = payload?.assetId
+    if (typeof projectId !== 'string' || typeof assetId !== 'string') {
+      return { error: 'invalid payload (projectId/assetId required)' }
     }
-    // 防路径穿越：相对路径必须在项目根下
-    const abs = path.resolve(projectRoot, relativePath)
-    const rel = path.relative(projectRoot, abs)
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
-      return { error: `path escapes project root: ${relativePath}` }
+    const { buffer } = await projectManager.readAssetBytes(projectId, assetId)
+    return { ok: true, data: new Uint8Array(buffer) }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+})
+
+// Runner → 主进程：批量加载资产字节（engine 文件服务后端，一次 invoke 返回所有）
+// 开发态资产量小，简单做；后续可改流式。payload: { projectId, assetIds } → { ok, results: { [id]: Uint8Array | { error } } }
+ipcMain.handle('runner:load-assets', async (_event, payload) => {
+  try {
+    const projectId = payload?.projectId
+    const assetIds = payload?.assetIds
+    if (typeof projectId !== 'string' || !Array.isArray(assetIds)) {
+      return { error: 'invalid payload (projectId/assetIds required)' }
     }
-    const content = await fs.readFile(abs, 'utf8')
-    return { content }
+    const results = {}
+    await Promise.all(assetIds.map(async (id) => {
+      try {
+        const { buffer } = await projectManager.readAssetBytes(projectId, id)
+        results[id] = new Uint8Array(buffer)
+      } catch (err) {
+        results[id] = { error: err instanceof Error ? err.message : String(err) }
+      }
+    }))
+    return { ok: true, results }
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
   }

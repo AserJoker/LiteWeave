@@ -545,6 +545,29 @@ export function createProjectManager(options = {}) {
   }
 
   /**
+   * 按资产 id（<namespace>:<path>）读取二进制字节。返回 { buffer: Buffer }。
+   * id 解析规则：<namespace>:<path> → assets/<namespace>/<path>（相对项目根）。
+   * 用于 engine 文件服务后端：主进程纯文件服务器，渲染主线程经 IPC 调此读资产字节建 GPU 对象。
+   */
+  async function readAssetBytes(projectId, assetId) {
+    const found = await findDirById(projectId)
+    if (!found) throw new Error(`项目不存在: ${projectId}`)
+    const { projectDir, meta } = found
+    const sepIdx = assetId.indexOf(':')
+    if (sepIdx < 0) throw new Error(`资产 id 非法（缺少 namespace）: ${assetId}`)
+    const ns = assetId.slice(0, sepIdx)
+    const relPath = assetId.slice(sepIdx + 1)
+    if (!ns || !relPath) throw new Error(`资产 id 非法: ${assetId}`)
+    if (!Array.isArray(meta.namespaces) || !meta.namespaces.includes(ns)) {
+      throw new Error(`namespace 未在项目声明: ${ns}`)
+    }
+    const virtualPath = path.join(ASSETS_DIR, ns, relPath).split(path.sep).join('/')
+    const abs = await resolveProjectPath(projectDir, virtualPath)
+    const buffer = await fs.readFile(abs) // 二进制 Buffer（不指定 encoding）
+    return { buffer }
+  }
+
+  /**
    * 写资源文件（创建或覆盖）。parent 目录不存在时自动创建；
    * 写文件后刷新 project.json 的 updatedAt。返回 { ok: true }。
    */
@@ -782,6 +805,7 @@ export function createProjectManager(options = {}) {
     readMetaConfig,
     // 通用资源文件 CRUD
     readFile,
+    readAssetBytes,
     writeFile,
     createFile,
     deleteFile,
