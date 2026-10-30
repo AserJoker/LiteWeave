@@ -441,7 +441,10 @@ export class Renderer {
         colorView = this.ensureAttachment(outName).createView()
       }
 
-      const depthView = pass.depthOutput ? this.ensureAttachment(pass.depthOutput).createView() : (isSwapchain ? this.depthTexture?.createView() : undefined)
+      // depth 只给声明了 depthOutput 的 pass 挂；swapchain pass（如 present blit）无 depth
+      // 之前 swapchain pass 无条件挂 this.depthTexture，但 present pipeline 无 depthState，
+      // resize 重建 depthTexture 后 renderPass 带 depth 与 pipeline 不匹配 → validation error 全黑
+      const depthView = pass.depthOutput ? this.ensureAttachment(pass.depthOutput).createView() : undefined
 
       const renderPass = commandEncoder.beginRenderPass({
         colorAttachments: [{ view: colorView, clearValue: { r: 0.1, g: 0.1, b: 0.12, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
