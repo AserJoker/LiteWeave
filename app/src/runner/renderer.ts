@@ -477,6 +477,34 @@ export class Renderer {
   }
 
   getFrameCount(): number { return this.frameCount }
+
+  /** 渲染状态快照（供 IDE inspect 打印渲染信息：MVP 矩阵、RO、资产计数等） */
+  inspect(): Record<string, unknown> {
+    const vp = this.viewProjection
+    const ros = [...this.ros.values()].map((ro) => ({
+      name: ro.name,
+      modelId: ro.modelId,
+      materialId: ro.materialId,
+      locked: ro.locked,
+      fields: [...ro.fields.keys()],
+    }))
+    return {
+      frameCount: this.frameCount,
+      canvas: `${this.canvas.width}×${this.canvas.height}`,
+      hasViewProjection: !!vp,
+      view: vp ? Array.from(vp.view) : null,
+      projection: vp ? Array.from(vp.projection) : null,
+      assets: {
+        graphs: this.assets.graphs.size,
+        pipelines: this.assets.pipelines.size,
+        pipelineBindings: [...this.assets.pipelineBindings.entries()].map(([id, bs]) => ({ id: id.slice(-35), bindings: bs.map(b => `${b.binding}:${b.kind}`) })),
+        shaders: this.assets.shaders.size,
+        models: this.assets.models.size,
+        materials: this.assets.materials.size,
+      },
+      ros,
+    }
+  }
 }
 
 function bytesPerAttr(format: string): number {

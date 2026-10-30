@@ -508,6 +508,32 @@ function registerMcpDebugTools(mcp) {
       return { result }
     },
   )
+
+  mcp.registerDebugTool(
+    'debug_screenshot',
+    '截取 Runner 窗口画面（data:image/png;base64）。仅用于证明是否渲染，细节请用 debug_runner_inspect 打印渲染信息（MVP 矩阵等）。',
+    async () => {
+      try {
+        const dataUrl = await runnerManager.capturePage()
+        return { dataUrl }
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) }
+      }
+    },
+  )
+
+  mcp.registerDebugTool(
+    'debug_runner_inspect',
+    '在 Runner 渲染进程主世界执行 JS 表达式，返回求值结果。用于打印渲染细节（MVP 矩阵/RO/资产等）。例：window.__renderer.inspect()',
+    async ({ expression }) => {
+      try {
+        const result = await runnerManager.inspect(expression)
+        return { result }
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) }
+      }
+    },
+  )
 }
 
 /** 启动内嵌 MCP server（node:http，仅 /mcp endpoint） */

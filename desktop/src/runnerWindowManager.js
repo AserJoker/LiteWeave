@@ -246,6 +246,13 @@ export function createRunnerWindowManager(opts) {
     return result
   }
 
+  /** 截图 Runner 窗口（用于验证是否渲染；细节靠 inspect 打印渲染信息） */
+  async function capturePage() {
+    if (!runnerWin) throw new Error('[runner] capturePage 时无活动 Runner')
+    const image = await runnerWin.webContents.capturePage()
+    return image.toDataURL() // data:image/png;base64,...
+  }
+
   /** 当前状态快照（runner:status 用） */
   function getStatus() {
     return {
@@ -269,6 +276,7 @@ export function createRunnerWindowManager(opts) {
     forwardConsole,
     sendToRunner,
     inspect,
+    capturePage,
     getStatus,
     RunnerStatus,
   }

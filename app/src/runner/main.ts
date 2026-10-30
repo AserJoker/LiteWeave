@@ -84,6 +84,8 @@ async function startRunner(
   // 3. 建 Renderer（主线程渲染状态机）并启动 rAF 循环
   const renderer = new Renderer(device, context, format, canvas)
   renderer.start()
+  // 挂到 window 供 IDE inspect（runner:inspect / debug_eval）访问渲染状态
+  ;(window as unknown as { __renderer?: Renderer }).__renderer = renderer
 
   // 4. 建 Worker，注入 bootstrap（首条 __bootstrap 消息）
   const worker = new Worker(new URL('./engineWorker.ts', import.meta.url), { type: 'module' })
