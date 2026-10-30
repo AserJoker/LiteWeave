@@ -9,6 +9,15 @@
 import { mat4 } from 'gl-matrix'
 import type { Command } from './protocol'
 
+/** 内置资源 id 前缀（不随 scene 销毁，reload 重建） */
+export const BUILTIN_PREFIX = '__builtin:'
+/** 内置资源 id 约定 */
+export const BUILTIN_IDS = {
+  quad: '__builtin:quad', // 全屏四边形（NDC -1..1，position@0 float32x2 + uv@1 float32x2）
+  white: '__builtin:white', // 1×1 白色纹理
+  checker: '__builtin:checker', // 灰色棋盘纹理（纹理缺失 fallback）
+} as const
+
 /** 静态 GPU 资产缓存（id → GPU 对象 / 解析数据） */
 interface AssetCache {
   graphs: Map<string, PipelineGraphRuntime>
@@ -100,6 +109,7 @@ export class Renderer {
 
   /** 启动渲染循环 */
   start(): void {
+    this.initBuiltinAssets()
     const resize = () => this.handleResize()
     resize()
     this.resizeObserver = new ResizeObserver(resize)
@@ -133,6 +143,63 @@ export class Renderer {
       m.indexBuffer.destroy()
     }
     this.assets = { graphs: new Map(), pipelines: new Map(), pipelineBindings: new Map(), shaders: new Map(), models: new Map(), materials: new Map(), textures: new Map() }
+    // 重建内置资源（永生：不随 scene 销毁，但 reload 重建）
+    this.initBuiltinAssets()
+  }
+
+  /** 预建内置资源（quad/white/checker），约定 id `__builtin:` 前缀 */
+  private initBuiltinAssets(): void {
+    // __builtin:quad —— 全屏四边形（NDC -1..1，position@0 float32x2 + uv@1 float32x2，stride 16）
+    {
+      const vertexData = new Float32Array([
+        -1, -1, 0, 0,
+        1, -1, 1, 0,
+        1, 1, 1, 1,
+        -1, 1, 0, 1,
+      ])
+      const indexData = new Uint16Array([0, 1, 2, 0, 2, 3])
+      const vertexBuffer = this.device.createBuffer({ size: vertexData.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST })
+      this.device.queue.writeBuffer(vertexBuffer, 0, vertexData)
+      const indexBuffer = this.device.createBuffer({ size: indexData.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST })
+      this.device.queue.writeBuffer(indexBuffer, 0, indexData)
+      this.assets.models.set(BUILTIN_IDS.quad, { vertexBuffer, indexBuffer, indexCount: indexData.length, stride: 16 })
+    }
+    // __builtin:white —— 1×1 白色 rgba8unorm 纹理
+    this.assets.textures.set(BUILTIN_IDS.white, this.createSolidTexture(255, 255, 255, 255))
+    // __builtin:checker —— 8×8 灰色棋盘 rgba8unorm 纹理（纹理缺失 fallback）
+    this.assets.textures.set(BUILTIN_IDS.checker, this.createCheckerTexture())
+    console.log('[renderer] 内置资源已预建: quad, white, checker')
+  }
+
+  /** 建 1×1 纯色纹理 */
+  private createSolidTexture(r: number, g: number, b: number, a: number): GPUTexture {
+    const tex = this.device.createTexture({
+      size: [1, 1],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.device.queue.writeTexture({ texture: tex }, new Uint8Array([r, g, b, a]), { bytesPerRow: 4 }, [1, 1])
+    return tex
+  }
+
+  /** 建 8×8 灰色棋盘纹理（深灰/浅灰交替） */
+  private createCheckerTexture(): GPUTexture {
+    const size = 8
+    const data = new Uint8Array(size * size * 4)
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4
+        const v = ((x + y) % 2 === 0) ? 200 : 100
+        data[i] = v; data[i + 1] = v; data[i + 2] = v; data[i + 3] = 255
+      }
+    }
+    const tex = this.device.createTexture({
+      size: [size, size],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.device.queue.writeTexture({ texture: tex }, data, { bytesPerRow: size * 4 }, [size, size])
+    return tex
   }
 
   /** 批量加载资产（收字节 → 按类型分流建 GPU 对象） */

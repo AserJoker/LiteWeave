@@ -161,21 +161,23 @@ async function setScene(id: string): Promise<Scene> {
   const scene = JSON.parse(text) as Scene
 
   // 组装批量加载资产列表：graph + 所有 RO 的 model/material + pipeline + scene 声明的 assets
+  // __builtin: 资源由渲染线程预建，不读磁盘，排除
   const assetIds = new Set<string>()
-  assetIds.add(scene.graph)
+  const addAsset = (id: string) => { if (!id.startsWith('__builtin:')) assetIds.add(id) }
+  addAsset(scene.graph)
   const pipelineIds: string[] = []
   for (const ro of scene.renderObjects) {
-    assetIds.add(ro.model)
-    assetIds.add(ro.material)
+    addAsset(ro.model)
+    addAsset(ro.material)
     for (const pid of Object.keys(ro.pipelineBindings)) {
-      assetIds.add(pid)
+      addAsset(pid)
       pipelineIds.push(pid)
     }
   }
   if (scene.assets) {
-    for (const m of scene.assets.models) assetIds.add(m)
-    for (const m of scene.assets.materials) assetIds.add(m)
-    for (const m of scene.assets.images) assetIds.add(m)
+    for (const m of scene.assets.models) addAsset(m)
+    for (const m of scene.assets.materials) addAsset(m)
+    for (const m of scene.assets.images) addAsset(m)
   }
 
   // pipeline 依赖 shader：先读 pipeline JSON 解析出 shader id 加入加载列表
@@ -187,7 +189,7 @@ async function setScene(id: string): Promise<Scene> {
     for (const b of pipelineBytes) {
       try {
         const desc = JSON.parse(new TextDecoder().decode(b)) as { shader?: string }
-        if (desc.shader) assetIds.add(desc.shader)
+        if (desc.shader) addAsset(desc.shader)
       } catch {
         // 解析失败留给主线程 buildPipeline 报错
       }
